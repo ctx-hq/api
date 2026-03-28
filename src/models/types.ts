@@ -77,7 +77,6 @@ export interface UserRow {
   email: string;
   avatar_url: string;
   github_id: string;
-  api_key_hash: string | null;
   role: "user" | "admin";
   created_at: string;
   updated_at: string;

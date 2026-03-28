@@ -8,160 +8,217 @@
 
 [中文文档](README.zh-CN.md)
 
-Package registry API for [getctx.org](https://getctx.org) — discover, publish, and resolve Claude Code skills, MCP servers, and CLI tools.
+The backend API for [getctx.org](https://getctx.org) — an open registry for discovering, publishing, and installing Claude Code skills, MCP servers, and CLI tools.
 
-Built with [Hono](https://hono.dev) on Cloudflare Workers, backed by D1, R2, and KV.
+```
+ctx install @anthropic/claude-skill    # that's it
+```
 
-## Features
+Built with [Hono](https://hono.dev) on Cloudflare Workers. Zero cold start, globally distributed.
 
-- **Package Management** — Scoped packages (`@scope/name`) with semver versioning
-- **Full-Text Search** — FTS5-powered search across names, descriptions, and keywords
-- **Version Resolution** — Constraint-based resolution (`^`, `~`, `>=`, `*`, exact)
-- **Organization Management** — Create orgs, manage members and roles
-- **Authenticated Publishing** — Device flow auth with GitHub OAuth
-- **Scanner Pipeline** — Auto-discover packages from GitHub, MCP Registry, Homebrew
-- **Agent-Readable** — `GET /:fullName.ctx` returns plain-text install instructions
+## Why ctx?
+
+AI coding agents (Claude Code, Cursor, Windsurf, etc.) need a shared way to discover and install tools. ctx provides:
+
+- A **package registry** for skills, MCP servers, and CLI tools
+- **One-command install** that auto-configures any supported agent
+- **Hybrid search** (FTS + vector embeddings) to find the right tool
+- An **open protocol** — `GET /:fullName.ctx` returns plain-text instructions any agent can parse
 
 ## Quick Start
 
 ```bash
+# Clone and install
+git clone https://github.com/ctx-hq/api.git && cd api
 pnpm install
+
+# Set up Cloudflare resources
+cp wrangler.toml.example wrangler.toml
+# Edit wrangler.toml — fill in your D1 database_id and KV namespace id
+
+# Create local database and start dev server
 pnpm db:migrate
 pnpm dev
 ```
 
-## Scripts
+## Contributing
+
+### Prerequisites
+
+- Node.js 22+, pnpm 10+
+- [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/) (`pnpm add -g wrangler`)
+- A Cloudflare account (free plan works)
+
+### Setup
+
+1. **Copy config template:**
+   ```bash
+   cp wrangler.toml.example wrangler.toml
+   ```
+
+2. **Create Cloudflare resources** (first time only):
+   ```bash
+   wrangler d1 create ctx-registry       # Copy the database_id into wrangler.toml
+   wrangler kv namespace create CACHE    # Copy the id into wrangler.toml
+   wrangler r2 bucket create ctx-formulas
+   ```
+
+3. **Set secrets** (for GitHub OAuth):
+   ```bash
+   wrangler secret put GITHUB_CLIENT_SECRET
+   ```
+
+4. **Apply migrations and run:**
+   ```bash
+   pnpm db:migrate
+   pnpm dev
+   ```
+
+### Scripts
 
 | Command | Description |
 |---------|-------------|
-| `pnpm dev` | Local development server |
-| `pnpm test` | Run test suite |
-| `pnpm test:watch` | Run tests in watch mode |
+| `pnpm dev` | Local dev server (port 8787) |
+| `pnpm test` | Run test suite (Vitest) |
 | `pnpm typecheck` | TypeScript type checking |
 | `pnpm db:migrate` | Apply D1 migrations locally |
 | `pnpm deploy` | Deploy to Cloudflare Workers |
 
-## API Endpoints
+### CI/CD
+
+Pushes to `main` trigger automatic deployment via GitHub Actions. Required secrets:
+
+| Secret | Purpose |
+|--------|---------|
+| `CLOUDFLARE_API_TOKEN` | Wrangler deploy authentication |
+| `D1_DATABASE_ID` | D1 database identifier |
+| `KV_NAMESPACE_ID` | KV namespace identifier |
+
+## API Reference
 
 ### Packages
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/v1/packages` | List packages (filter by `type`, sort by `downloads`\|`created`) |
-| GET | `/v1/packages/:fullName` | Get package details with version history |
-| GET | `/v1/packages/:fullName/versions` | List all versions |
-| GET | `/v1/packages/:fullName/versions/:version` | Get specific version |
-
-### Publishing (auth required)
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/v1/publish` | Publish a package version (multipart: manifest + archive) |
-| POST | `/v1/yank/:fullName/:version` | Yank a version |
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/v1/packages` | — | List packages (filter: `type`, `category`; sort: `downloads`, `created`) |
+| GET | `/v1/packages/:fullName` | — | Package details with version history and categories |
+| GET | `/v1/packages/:fullName/versions` | — | List all versions |
+| GET | `/v1/packages/:fullName/versions/:version` | — | Version detail (manifest, readme, publisher username) |
 
 ### Search & Resolution
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/v1/search?q=` | Full-text search |
-| POST | `/v1/resolve` | Bulk version constraint resolution |
-| GET | `/v1/packages/:fullName/resolve/:constraint` | Resolve single constraint |
-| GET | `/:fullName.ctx` | Agent-readable install instructions |
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/v1/search?q=&mode=` | — | Search packages (mode: `fts`, `vector`, `hybrid`) |
+| POST | `/v1/resolve` | — | Bulk version constraint resolution |
+| GET | `/v1/packages/:fullName/resolve/:constraint` | — | Resolve single version constraint |
+| GET | `/:fullName.ctx` | — | Agent-readable install instructions (plain text) |
+| GET | `/v1/categories` | — | List all categories with package counts |
 
-### Download
+### Publishing
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/v1/download/:fullName/:version` | Download formula archive |
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/v1/publish` | Bearer | Publish a version (multipart: manifest + archive) |
+| POST | `/v1/yank/:fullName/:version` | Bearer | Yank a version |
+| GET | `/v1/download/:fullName/:version` | — | Download formula archive |
 
-### Authentication
+### Authentication & Account
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/v1/auth/device` | Start device authorization flow |
-| POST | `/v1/auth/token` | Poll for access token |
-| GET | `/v1/auth/callback` | GitHub OAuth callback |
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/v1/auth/device` | — | Start device authorization flow |
+| POST | `/v1/auth/token` | — | Poll for access token |
+| POST | `/v1/auth/github` | — | Exchange GitHub OAuth code for token |
+| GET | `/v1/me` | Bearer | Current user profile |
+| GET | `/v1/me/tokens` | Bearer | List API tokens (never exposes token values) |
+| POST | `/v1/me/tokens` | Bearer | Create a named token (optional: `expires_in_days`) |
+| DELETE | `/v1/me/tokens/:id` | Bearer | Revoke a token |
+| DELETE | `/v1/me` | Bearer | Delete account (anonymize PII, reassign packages) |
 
-### Organizations (auth required)
+### Organizations
 
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/v1/orgs` | Create organization |
-| GET | `/v1/orgs/:name` | Get org details |
-| GET | `/v1/orgs/:name/members` | List members |
-| POST | `/v1/orgs/:name/members` | Add member (owner/admin) |
-| DELETE | `/v1/orgs/:name/members/:username` | Remove member (owner) |
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST | `/v1/orgs` | Bearer | Create organization |
+| GET | `/v1/orgs/:name` | — | Org details |
+| GET | `/v1/orgs/:name/members` | Bearer | List members (members only) |
+| POST | `/v1/orgs/:name/members` | Bearer | Add member (owner/admin only) |
+| DELETE | `/v1/orgs/:name/members/:username` | Bearer | Remove member (owner only) |
 
 ### Scanner (admin)
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/v1/scanner/candidates` | List discovered candidates |
-| POST | `/v1/scanner/run` | Trigger manual scan |
-| POST | `/v1/scanner/candidates/:id/approve` | Approve and import |
-| POST | `/v1/scanner/candidates/:id/reject` | Reject candidate |
-| GET | `/v1/scanner/stats` | Scanner statistics |
-
-### System
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/` | Registry metadata |
-| GET | `/v1/health` | Health check |
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/v1/scanner/sources` | Bearer | List scanner sources |
+| GET | `/v1/scanner/candidates` | Bearer | List discovered candidates |
+| GET | `/v1/scanner/candidates/:id` | Bearer | Candidate detail |
+| POST | `/v1/scanner/run` | Admin | Trigger manual scan |
+| POST | `/v1/scanner/candidates/:id/approve` | Admin | Approve and import |
+| POST | `/v1/scanner/candidates/:id/reject` | Admin | Reject candidate |
+| GET | `/v1/scanner/stats` | Bearer | Scanner statistics |
 
 ## Architecture
 
 ```
 src/
-├── index.ts              # App entry, route mounting, error handling
-├── bindings.ts           # Cloudflare binding types
-├── models/types.ts       # Shared TypeScript interfaces
-├── routes/               # HTTP endpoint handlers
-├── services/             # Business logic
-├── middleware/            # Auth, CORS, rate limiting
-└── utils/                # Naming validation, semver, errors
-migrations/               # D1 SQL migrations (0001–0005)
-test/                     # Vitest test suite
+├── index.ts                # Entry point, middleware, error handling, cron
+├── bindings.ts             # Cloudflare binding type definitions
+├── models/types.ts         # Shared TypeScript interfaces
+├── routes/                 # HTTP handlers
+│   ├── auth.ts             # OAuth, tokens, account deletion
+│   ├── packages.ts         # Package CRUD
+│   ├── search.ts           # FTS + vector hybrid search
+│   ├── publish.ts          # Package publishing
+│   ├── resolve.ts          # Bulk version resolution
+│   ├── versions.ts         # Single version resolution
+│   ├── download.ts         # Archive downloads
+│   ├── orgs.ts             # Organization management
+│   ├── scanner.ts          # Package discovery pipeline
+│   ├── agent.ts            # /:fullName.ctx agent endpoint
+│   ├── categories.ts       # Category listing
+│   └── health.ts           # Health check
+├── services/               # Business logic
+│   ├── scanner.ts          # GitHub topic scanner
+│   ├── importer.ts         # Candidate → package import
+│   ├── enrichment.ts       # LLM-powered metadata enrichment
+│   ├── search.ts           # Hybrid search engine
+│   ├── categories.ts       # Category seeding and queries
+│   └── publish.ts          # Publish validation
+├── middleware/
+│   ├── auth.ts             # Bearer token authentication
+│   ├── security-headers.ts # Security headers + CORS
+│   └── rate-limit.ts       # Per-user / per-IP rate limiting
+└── utils/                  # Naming, semver, errors, response helpers
+migrations/                 # D1 SQL migrations (0001–0009)
+test/                       # Vitest test suite
 ```
 
 ### Cloudflare Bindings
 
 | Binding | Type | Purpose |
 |---------|------|---------|
-| DB | D1 | Package metadata, users, organizations |
+| DB | D1 | Package metadata, users, orgs, audit log |
 | FORMULAS | R2 | Formula archive storage (tar.gz) |
 | CACHE | KV | Rate limiting, device flow state |
+| VECTORIZE | Vectorize | Package embedding index for semantic search |
+| AI | Workers AI | Embedding generation and metadata enrichment |
+| ENRICHMENT_QUEUE | Queue | Async enrichment pipeline |
+
+### Security
+
+- **Authentication**: SHA-256 hashed Bearer tokens (high-entropy, unsalted — same approach as GitHub/npm)
+- **Rate limiting**: 180 req/min per IP (anonymous), 600 req/min per user (authenticated, keyed by user ID)
+- **Security headers**: `X-Content-Type-Options`, `X-Frame-Options`, `Content-Security-Policy`, `Referrer-Policy`
+- **Account deletion**: Full PII anonymization with unique tombstones, package reassignment to sentinel user
+- **Data minimization**: API responses never expose internal UUIDs; `published_by` returns username via JOIN
 
 ## Package Naming
 
 Packages follow scoped naming: `@scope/name`
 
 - Scope and name: lowercase alphanumeric with hyphens
-- Example: `@anthropic/claude-skill`, `@community/my-tool`
-
-## Version Constraints
-
-| Constraint | Matches |
-|-----------|---------|
-| `*` / `latest` | Highest available version |
-| `^1.2.3` | `>=1.2.3` and `<2.0.0` |
-| `~1.2.3` | `>=1.2.3` and `<1.3.0` |
-| `>=1.2.3` | Any version `>=1.2.3` |
-| `1.2.3` | Exact match |
-
-## Rate Limiting
-
-- 180 requests per minute per IP
-- Applies to all `/v1/*` endpoints
-- Returns `429 Too Many Requests` with `Retry-After` header
-
-## Deployment
-
-Requires a `CLOUDFLARE_API_TOKEN` secret configured in GitHub Actions. Pushes to `main` trigger automatic deployment.
-
-```bash
-pnpm deploy
-```
+- Examples: `@anthropic/claude-skill`, `@community/github-mcp`
 
 ## License
 

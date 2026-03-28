@@ -3,6 +3,7 @@ import type { AppEnv } from "../bindings";
 import { generateId } from "../utils/response";
 import { hashToken } from "../services/auth";
 import { authMiddleware } from "../middleware/auth";
+import { badRequest, forbidden } from "../utils/errors";
 
 const app = new Hono<AppEnv>();
 
@@ -200,6 +201,134 @@ app.get("/v1/me", authMiddleware, async (c) => {
     email: user.email,
     avatar_url: user.avatar_url,
   });
+});
+
+// --- Token Management ---
+
+// List current user's tokens
+app.get("/v1/me/tokens", authMiddleware, async (c) => {
+  const user = c.get("user");
+  const result = await c.env.DB.prepare(
+    "SELECT id, name, created_at, last_used_at, expires_at FROM api_tokens WHERE user_id = ? ORDER BY created_at DESC"
+  ).bind(user.id).all();
+
+  return c.json({ tokens: result.results ?? [] });
+});
+
+// Create a new named token
+app.post("/v1/me/tokens", authMiddleware, async (c) => {
+  const user = c.get("user");
+  let body: { name?: string; expires_in_days?: number };
+  try {
+    body = await c.req.json();
+  } catch {
+    throw badRequest("Invalid JSON body");
+  }
+
+  const tokenName = body.name?.trim();
+  if (!tokenName) {
+    throw badRequest("Token name is required");
+  }
+
+  if (body.expires_in_days !== undefined) {
+    if (!Number.isInteger(body.expires_in_days) || body.expires_in_days < 1 || body.expires_in_days > 365) {
+      throw badRequest("expires_in_days must be an integer between 1 and 365");
+    }
+  }
+
+  const token = `ctx_${generateId()}${generateId()}`;
+  const tokenHash = await hashToken(token);
+  const tokenId = generateId();
+
+  if (body.expires_in_days) {
+    const expiresAt = new Date(Date.now() + body.expires_in_days * 86400_000).toISOString();
+    await c.env.DB.prepare(
+      "INSERT INTO api_tokens (id, user_id, token_hash, name, expires_at) VALUES (?, ?, ?, ?, ?)"
+    ).bind(tokenId, user.id, tokenHash, tokenName, expiresAt).run();
+  } else {
+    await c.env.DB.prepare(
+      "INSERT INTO api_tokens (id, user_id, token_hash, name) VALUES (?, ?, ?, ?)"
+    ).bind(tokenId, user.id, tokenHash, tokenName).run();
+  }
+
+  return c.json({ id: tokenId, token, name: tokenName }, 201);
+});
+
+// Revoke a token
+app.delete("/v1/me/tokens/:tokenId", authMiddleware, async (c) => {
+  const user = c.get("user");
+  const tokenId = c.req.param("tokenId");
+
+  const result = await c.env.DB.prepare(
+    "DELETE FROM api_tokens WHERE id = ? AND user_id = ?"
+  ).bind(tokenId, user.id).run();
+
+  if (!result.meta.changes) {
+    throw badRequest("Token not found");
+  }
+
+  return c.json({ revoked: true });
+});
+
+// --- Account Deletion ---
+
+// Delete current user's account (anonymize + cascade)
+app.delete("/v1/me", authMiddleware, async (c) => {
+  const user = c.get("user");
+
+  // Prevent deleting system accounts
+  if (user.id === "system-scanner" || user.id === "system-deleted") {
+    throw forbidden("System accounts cannot be deleted");
+  }
+
+  // Check if user is sole owner of any org
+  const soleOwnerOrgs = await c.env.DB.prepare(
+    `SELECT o.name FROM org_members m
+     JOIN orgs o ON m.org_id = o.id
+     WHERE m.user_id = ? AND m.role = 'owner'
+     AND (SELECT COUNT(*) FROM org_members m2 WHERE m2.org_id = m.org_id AND m2.role = 'owner') = 1`
+  ).bind(user.id).all();
+
+  if (soleOwnerOrgs.results && soleOwnerOrgs.results.length > 0) {
+    const orgNames = soleOwnerOrgs.results.map((r) => `@${r.name}`).join(", ");
+    throw badRequest(
+      `Cannot delete account: you are the sole owner of ${orgNames}. Transfer ownership first.`
+    );
+  }
+
+  const anonymizedUsername = `deleted-${user.id.slice(0, 8)}`;
+
+  // Execute all deletions/anonymizations in a batch
+  await c.env.DB.batch([
+    // Anonymize user row — github_id uses unique tombstone to avoid UNIQUE constraint collision
+    c.env.DB.prepare(
+      `UPDATE users SET username = ?, email = '', avatar_url = '', github_id = ?,
+       updated_at = datetime('now') WHERE id = ?`
+    ).bind(anonymizedUsername, `deleted:${user.id}`, user.id),
+    // Reassign package ownership
+    c.env.DB.prepare(
+      "UPDATE packages SET owner_id = 'system-deleted' WHERE owner_id = ?"
+    ).bind(user.id),
+    // Reassign version publisher references
+    c.env.DB.prepare(
+      "UPDATE versions SET published_by = 'system-deleted' WHERE published_by = ?"
+    ).bind(user.id),
+    // Revoke all tokens
+    c.env.DB.prepare(
+      "DELETE FROM api_tokens WHERE user_id = ?"
+    ).bind(user.id),
+    // Remove org memberships
+    c.env.DB.prepare(
+      "DELETE FROM org_members WHERE user_id = ?"
+    ).bind(user.id),
+    // Audit event
+    c.env.DB.prepare(
+      `INSERT INTO audit_events (id, actor_id, action, target_type, target_id, metadata)
+       VALUES (?, ?, 'account_deleted', 'user', ?, '{}')`
+    ).bind(generateId(), user.id, user.id),
+  ]);
+
+  return c.json({ deleted: true });
 });
 
 export default app;

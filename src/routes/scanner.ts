@@ -9,7 +9,7 @@ const app = new Hono<AppEnv>();
 // List scanner sources
 app.get("/v1/scanner/sources", authMiddleware, async (c) => {
   const sources = await c.env.DB.prepare(
-    "SELECT * FROM scanner_sources ORDER BY created_at"
+    "SELECT id, type, source_key, enabled, total_found, last_scanned, created_at FROM scanner_sources ORDER BY created_at"
   ).all();
   return c.json({ sources: sources.results ?? [] });
 });
@@ -26,7 +26,9 @@ app.get("/v1/scanner/candidates", authMiddleware, async (c) => {
   const type_ = c.req.query("type");
   const limit = Math.min(parseInt(c.req.query("limit") ?? "50") || 50, 200);
 
-  let sql = "SELECT * FROM scanner_candidates WHERE status = ?";
+  let sql = `SELECT id, external_url, detected_type, detected_name, status,
+                    confidence, stars, license, last_checked
+             FROM scanner_candidates WHERE status = ?`;
   const params: unknown[] = [status];
 
   if (type_) {
@@ -45,7 +47,9 @@ app.get("/v1/scanner/candidates", authMiddleware, async (c) => {
 app.get("/v1/scanner/candidates/:id", authMiddleware, async (c) => {
   const id = c.req.param("id");
   const candidate = await c.env.DB.prepare(
-    "SELECT * FROM scanner_candidates WHERE id = ?"
+    `SELECT external_url, external_id, detected_type, detected_name,
+            generated_manifest, status, confidence, stars, license, last_checked
+     FROM scanner_candidates WHERE id = ?`
   ).bind(id).first();
 
   if (!candidate) {

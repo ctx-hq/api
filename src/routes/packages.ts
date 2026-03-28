@@ -75,7 +75,10 @@ app.get("/v1/packages/:fullName", async (c) => {
   const fullName = decodeURIComponent(c.req.param("fullName"));
 
   const pkg = await c.env.DB.prepare(
-    "SELECT * FROM packages WHERE full_name = ?"
+    `SELECT id, full_name, type, description, summary, capabilities, license,
+            repository, homepage, author, keywords, platforms, downloads,
+            created_at, updated_at
+     FROM packages WHERE full_name = ?`
   ).bind(fullName).first();
 
   if (!pkg) {
@@ -142,7 +145,11 @@ app.get("/v1/packages/:fullName/versions/:version", async (c) => {
   if (!pkg) throw notFound(`Package ${fullName} not found`);
 
   const ver = await c.env.DB.prepare(
-    "SELECT * FROM versions WHERE package_id = ? AND version = ?"
+    `SELECT v.version, v.manifest, v.readme, v.sha256, v.yanked, v.created_at,
+            u.username AS publisher
+     FROM versions v
+     LEFT JOIN users u ON v.published_by = u.id
+     WHERE v.package_id = ? AND v.version = ?`
   ).bind(pkg.id, version).first();
 
   if (!ver) throw notFound(`Version ${version} not found`);
@@ -153,7 +160,7 @@ app.get("/v1/packages/:fullName/versions/:version", async (c) => {
     readme: ver.readme,
     sha256: ver.sha256,
     yanked: ver.yanked === 1,
-    published_by: ver.published_by,
+    published_by: (ver.publisher as string) ?? "[unknown]",
     created_at: ver.created_at,
   });
 });

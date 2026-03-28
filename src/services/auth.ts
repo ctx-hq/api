@@ -13,6 +13,9 @@ export async function generateAPIToken(): Promise<{ token: string; hash: string 
   return { token, hash };
 }
 
+// SHA-256 is appropriate here: tokens have ~244 bits of entropy (two UUIDs),
+// making rainbow tables and brute-force infeasible. Salting only helps for
+// low-entropy inputs (passwords). GitHub/npm/PyPI use the same approach.
 export async function hashToken(token: string): Promise<string> {
   const data = new TextEncoder().encode(token);
   const hash = await crypto.subtle.digest("SHA-256", data);

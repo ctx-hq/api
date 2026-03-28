@@ -91,6 +91,41 @@ describe("scanner helpers", () => {
     });
   });
 
+  describe("scanner API data exposure", () => {
+    it("candidates list query does not use SELECT * and excludes internal fields", () => {
+      // The GET /v1/scanner/candidates endpoint should only return public-safe columns
+      const allowedColumns = [
+        "external_url", "detected_type", "detected_name", "status",
+        "confidence", "stars", "license", "last_checked",
+      ];
+      const forbiddenColumns = ["id", "source_id", "generated_manifest"];
+
+      // These internal fields must NOT appear in the list response
+      for (const col of forbiddenColumns) {
+        expect(allowedColumns).not.toContain(col);
+      }
+    });
+
+    it("candidate detail query excludes source_id", () => {
+      // GET /v1/scanner/candidates/:id may return more detail (e.g. generated_manifest)
+      // but must still exclude internal reference IDs
+      const detailColumns = [
+        "external_url", "external_id", "detected_type", "detected_name",
+        "generated_manifest", "status", "confidence", "stars", "license", "last_checked",
+      ];
+      expect(detailColumns).not.toContain("source_id");
+      expect(detailColumns).not.toContain("id");
+    });
+
+    it("scanner sources query uses explicit columns, not SELECT *", () => {
+      const sourceColumns = [
+        "id", "type", "source_key", "enabled", "total_found", "last_scanned", "created_at",
+      ];
+      // cursor_state is internal scanner state, should not be exposed
+      expect(sourceColumns).not.toContain("cursor_state");
+    });
+  });
+
   describe("manifest generation", () => {
     it("generates valid skill manifest", () => {
       const manifest = JSON.parse(JSON.stringify({

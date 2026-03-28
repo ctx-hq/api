@@ -10,7 +10,7 @@ routes = [
 [[d1_databases]]
 binding = "DB"
 database_name = "ctx-registry"
-database_id = "REDACTED_D1_DATABASE_ID"
+database_id = "<your-d1-database-id>"
 migrations_dir = "migrations"
 
 [[r2_buckets]]
@@ -19,7 +19,7 @@ bucket_name = "ctx-formulas"
 
 [[kv_namespaces]]
 binding = "CACHE"
-id = "REDACTED_KV_NAMESPACE_ID"
+id = "<your-kv-namespace-id>"
 
 [[vectorize]]
 binding = "VECTORIZE"
@@ -41,6 +41,9 @@ max_batch_timeout = 30
 API_VERSION = "v1"
 GITHUB_CLIENT_ID = ""
 
+# Secrets (set via `wrangler secret put`):
+#   GITHUB_CLIENT_SECRET
+
+# Cron trigger for scanner (requires available cron slot, limit: 5 per account)
 # [triggers]
 # crons = ["0 */6 * * *"]
-# TODO: Free plan cron limit reached, enable when upgraded or free up a slot

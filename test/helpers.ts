@@ -11,24 +11,28 @@ export function createMockEnv() {
   };
 }
 
-function createMockD1() {
-  const data: Map<string, unknown[]> = new Map();
+export interface MockD1 {
+  prepare(sql: string): MockD1Statement;
+  batch(statements: MockD1Statement[]): Promise<unknown[]>;
+  _tables: Map<string, unknown[]>;
+}
 
-  return {
+interface MockD1Statement {
+  bind(...params: unknown[]): MockD1Statement;
+  first(): Promise<unknown>;
+  all(): Promise<{ results: unknown[] }>;
+  run(): Promise<{ success: boolean; meta: { changes: number } }>;
+}
+
+function createMockD1(): MockD1 {
+  const tables: Map<string, unknown[]> = new Map();
+
+  const db: MockD1 = {
+    _tables: tables,
     prepare(sql: string) {
       return {
         bind(...params: unknown[]) {
-          return {
-            async first() {
-              return null;
-            },
-            async all() {
-              return { results: [] };
-            },
-            async run() {
-              return { success: true };
-            },
-          };
+          return this;
         },
         async first() {
           return null;
@@ -37,11 +41,20 @@ function createMockD1() {
           return { results: [] };
         },
         async run() {
-          return { success: true };
+          return { success: true, meta: { changes: 0 } };
         },
       };
     },
+    async batch(statements: MockD1Statement[]) {
+      const results = [];
+      for (const stmt of statements) {
+        results.push(await stmt.run());
+      }
+      return results;
+    },
   };
+
+  return db;
 }
 
 function createMockR2() {

@@ -18,6 +18,13 @@ jobs:
           cache: pnpm
       - run: pnpm install
       - run: pnpm test
+
+      - name: Generate wrangler.toml
+        run: |
+          cp wrangler.toml.example wrangler.toml
+          sed -i 's/<your-d1-database-id>/${{ secrets.D1_DATABASE_ID }}/' wrangler.toml
+          sed -i 's/<your-kv-namespace-id>/${{ secrets.KV_NAMESPACE_ID }}/' wrangler.toml
+
       - uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}

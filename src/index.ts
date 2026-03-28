@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import type { AppEnv, Bindings } from "./bindings";
 import type { EnrichmentMessage } from "./models/types";
-import { corsMiddleware } from "./middleware/cors";
+import { securityHeaders } from "./middleware/security-headers";
 import { rateLimitMiddleware } from "./middleware/rate-limit";
 import { AppError } from "./utils/errors";
 
@@ -21,8 +21,21 @@ import categories from "./routes/categories";
 const app = new Hono<AppEnv>();
 
 // Global middleware
-app.use("*", corsMiddleware);
+app.use("*", securityHeaders);
 app.use("/v1/*", rateLimitMiddleware);
+
+// Probabilistic audit log cleanup (~1% of requests, non-blocking)
+// Runs inline because free-plan cron slots are limited
+app.use("/v1/*", async (c, next) => {
+  await next();
+  if (Math.random() < 0.01) {
+    c.executionCtx.waitUntil(
+      c.env.DB.prepare(
+        "DELETE FROM audit_events WHERE created_at < datetime('now', '-90 days') LIMIT 1000"
+      ).run()
+    );
+  }
+});
 
 // Error handler
 app.onError((err, c) => {
