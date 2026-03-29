@@ -7,6 +7,50 @@ import { canAccessPackage } from "../services/publisher";
 
 const app = new Hono<AppEnv>();
 
+// Registry overview (aggregate stats)
+app.get("/v1/stats/overview", async (c) => {
+  const [packagesResult, downloadsResult, publishersResult, breakdownResult] =
+    await Promise.all([
+      c.env.DB.prepare(
+        "SELECT COUNT(*) as count FROM packages WHERE visibility = 'public' AND deleted_at IS NULL",
+      )
+        .first<{ count: number }>(),
+
+      c.env.DB.prepare(
+        "SELECT COALESCE(SUM(downloads), 0) as total FROM packages WHERE visibility = 'public' AND deleted_at IS NULL",
+      )
+        .first<{ total: number }>(),
+
+      c.env.DB.prepare(
+        "SELECT COUNT(DISTINCT publisher_id) as count FROM packages WHERE visibility = 'public' AND deleted_at IS NULL",
+      )
+        .first<{ count: number }>(),
+
+      c.env.DB.prepare(
+        `SELECT type, COUNT(*) as count FROM packages
+         WHERE visibility = 'public' AND deleted_at IS NULL
+         GROUP BY type ORDER BY count DESC`,
+      ).all(),
+    ]);
+
+  const totalPackages = packagesResult?.count ?? 0;
+  const breakdown = (breakdownResult.results ?? []).map((r) => ({
+    type: r.type as string,
+    count: r.count as number,
+    percentage:
+      totalPackages > 0
+        ? Math.round(((r.count as number) / totalPackages) * 1000) / 10
+        : 0,
+  }));
+
+  return c.json({
+    total_packages: totalPackages,
+    total_downloads: downloadsResult?.total ?? 0,
+    total_publishers: publishersResult?.count ?? 0,
+    breakdown,
+  });
+});
+
 // Package stats (daily/weekly + agent breakdown)
 app.get("/v1/packages/:fullName/stats", optionalAuth, async (c) => {
   const fullName = decodeURIComponent(c.req.param("fullName")!);

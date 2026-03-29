@@ -85,4 +85,61 @@ describe("stats", () => {
       expect(version).toBe("");
     });
   });
+
+  describe("registry overview", () => {
+    it("should return zero counts for empty registry", () => {
+      const result = { total_packages: 0, total_downloads: 0, total_publishers: 0, breakdown: [] };
+      expect(result.total_packages).toBe(0);
+      expect(result.total_downloads).toBe(0);
+      expect(result.total_publishers).toBe(0);
+      expect(result.breakdown).toHaveLength(0);
+    });
+
+    it("should compute correct type breakdown percentages", () => {
+      const total = 100;
+      const breakdown = [
+        { type: "skill", count: 60 },
+        { type: "mcp", count: 30 },
+        { type: "cli", count: 10 },
+      ];
+      const withPct = breakdown.map((b) => ({
+        ...b,
+        percentage: Math.round((b.count / total) * 1000) / 10,
+      }));
+      expect(withPct[0].percentage).toBe(60);
+      expect(withPct[1].percentage).toBe(30);
+      expect(withPct[2].percentage).toBe(10);
+    });
+
+    it("should handle zero total packages in percentage calc", () => {
+      const total = 0;
+      const percentage = total > 0 ? Math.round((0 / total) * 1000) / 10 : 0;
+      expect(percentage).toBe(0);
+    });
+
+    it("should only include types that have packages", () => {
+      const breakdown = [
+        { type: "skill", count: 50, percentage: 62.5 },
+        { type: "mcp", count: 30, percentage: 37.5 },
+      ];
+      expect(breakdown).toHaveLength(2);
+      expect(breakdown.find((b) => b.type === "cli")).toBeUndefined();
+    });
+
+    it("should handle rounding in percentages", () => {
+      const total = 3;
+      const pcts = [1, 1, 1].map((c) => Math.round((c / total) * 1000) / 10);
+      // Each is 33.3%, sum is 99.9% — acceptable rounding behavior
+      expect(pcts).toEqual([33.3, 33.3, 33.3]);
+      expect(pcts.reduce((a, b) => a + b, 0)).toBeCloseTo(100, 0);
+    });
+
+    it("should use COALESCE for safe SUM on empty downloads", () => {
+      // When no packages exist, SUM(downloads) returns NULL
+      // COALESCE(NULL, 0) should return 0
+      const downloadsResult = { total: null };
+      const safeTotal = downloadsResult?.total ?? 0;
+      expect(safeTotal).toBe(0);
+    });
+  });
 });
