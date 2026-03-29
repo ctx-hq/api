@@ -9,7 +9,6 @@ export type Bindings = {
   ENRICHMENT_QUEUE: Queue;
   GITHUB_CLIENT_ID: string;
   GITHUB_CLIENT_SECRET: string;
-  API_VERSION: string;
 };
 
 export type AppEnv = {

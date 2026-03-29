@@ -4,8 +4,8 @@ import type { EnrichmentMessage } from "./models/types";
 import { securityHeaders } from "./middleware/security-headers";
 import { rateLimitMiddleware } from "./middleware/rate-limit";
 import { AppError } from "./utils/errors";
-
 import health from "./routes/health";
+import root from "./routes/root";
 import packages from "./routes/packages";
 import search from "./routes/search";
 import publish from "./routes/publish";
@@ -67,16 +67,7 @@ app.route("/", tags);
 app.route("/", stats);
 app.route("/", publishers);
 app.route("/", sync);
-
-// Root
-app.get("/", (c) => {
-  return c.json({
-    name: "ctx registry",
-    version: "0.1.0",
-    docs: "https://getctx.org/docs",
-    api: "https://api.getctx.org/v1",
-  });
-});
+app.route("/", root);
 
 // 404 handler — consistent JSON format for unmatched routes
 app.notFound((c) => {

@@ -4,12 +4,12 @@ import { APP_VERSION } from "../version";
 
 const app = new Hono<AppEnv>();
 
-app.get("/v1/health", (c) => {
+app.get("/", (c) => {
   return c.json({
-    status: "ok",
+    name: "ctx registry",
     version: APP_VERSION,
-    api_version: "v1",
-    timestamp: new Date().toISOString(),
+    docs: "https://getctx.org/docs",
+    api: "https://api.getctx.org/v1",
   });
 });
 

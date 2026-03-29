@@ -7,7 +7,6 @@ export function createMockEnv() {
     CACHE: createMockKV(),
     GITHUB_CLIENT_ID: "test-client-id",
     GITHUB_CLIENT_SECRET: "test-client-secret",
-    API_VERSION: "v1",
   };
 }
 

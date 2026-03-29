@@ -38,7 +38,6 @@ max_batch_size = 10
 max_batch_timeout = 30
 
 [vars]
-API_VERSION = "v1"
 GITHUB_CLIENT_ID = ""
 
 # Secrets (set via `wrangler secret put`):

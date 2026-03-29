@@ -91,7 +91,7 @@ function createPublisherApp(user?: { id: string }) {
   const app = new Hono<AppEnv>();
   app.use("*", async (c, next) => {
     (c as any).env = { DB: db, CACHE: { get: async () => null, put: async () => {}, delete: async () => {} } };
-    if (user) c.set("user", user);
+    if (user) c.set("user", user as any);
     await next();
   });
 

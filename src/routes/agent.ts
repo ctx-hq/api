@@ -9,7 +9,7 @@ const app = new Hono<AppEnv>();
 // Agent-readable endpoint: GET /:fullName.ctx
 // Returns plain text install instructions that an agent can understand
 app.get("/:fullName{.+\\.ctx$}", optionalAuth, async (c) => {
-  const path = c.req.param("fullName");
+  const path = c.req.param("fullName")!;
   const fullName = path.replace(/\.ctx$/, "");
 
   const pkg = await c.env.DB.prepare(
