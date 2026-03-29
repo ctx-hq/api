@@ -54,7 +54,7 @@ app.post("/v1/orgs", authMiddleware, async (c) => {
 });
 
 // Get org detail
-app.get("/v1/orgs/:name", async (c) => {
+app.get("/v1/orgs/:name", optionalAuth, async (c) => {
   const name = c.req.param("name");
   const org = await c.env.DB.prepare(
     "SELECT * FROM orgs WHERE name = ?"
@@ -66,8 +66,14 @@ app.get("/v1/orgs/:name", async (c) => {
     "SELECT COUNT(*) as count FROM org_members WHERE org_id = ?"
   ).bind(org.id).first();
 
+  // Package count: members see all, others see only public (consistent with /packages)
+  const user = c.get("user");
+  const publisher = await getPublisherForScope(c.env.DB, name!);
+  const isMember = user && publisher ? await canPublish(c.env.DB, user.id, publisher) : false;
+  const visibilityClause = isMember ? "" : "AND visibility = 'public'";
+
   const packageCount = await c.env.DB.prepare(
-    "SELECT COUNT(*) as count FROM packages WHERE scope = ?"
+    `SELECT COUNT(*) as count FROM packages WHERE scope = ? ${visibilityClause} AND deleted_at IS NULL`,
   ).bind(name).first();
 
   return c.json({
