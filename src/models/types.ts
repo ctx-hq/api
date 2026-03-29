@@ -21,6 +21,14 @@ export interface PackageRow {
   keywords: string; // JSON array
   platforms: string; // JSON array
   owner_id: string;
+  publisher_id: string;
+  visibility: Visibility;
+  mutable: number;
+  deleted_at: string | null;
+  deprecated_message: string | null;
+  deprecated_at: string | null;
+  source_repo: string;
+  source_verified: number;
   downloads: number;
   enrichment_status: EnrichmentStatus;
   enriched_at: string | null;
@@ -67,6 +75,7 @@ export interface VersionRow {
   formula_key: string;
   sha256: string;
   yanked: number;
+  trust_tier: TrustTier;
   published_by: string;
   created_at: string;
 }
@@ -88,6 +97,81 @@ export interface OrgRow {
   display_name: string;
   created_by: string;
   created_at: string;
+}
+
+export type Visibility = "public" | "unlisted" | "private";
+
+export type TrustTier = "unverified" | "structural" | "source_linked" | "reviewed" | "verified";
+
+export interface PublisherRow {
+  id: string;
+  kind: "user" | "org";
+  user_id: string | null;
+  org_id: string | null;
+  slug: string;
+  created_at: string;
+}
+
+export interface DistTagRow {
+  id: string;
+  package_id: string;
+  tag: string;
+  version_id: string;
+  updated_at: string;
+}
+
+export interface TrustCheckRow {
+  id: string;
+  version_id: string;
+  check_type: string;
+  status: "pending" | "passed" | "failed" | "skipped";
+  score: number | null;
+  details: string;
+  checked_at: string;
+}
+
+export interface DownloadStatRow {
+  id: string;
+  package_id: string;
+  version: string;
+  date: string;
+  count: number;
+}
+
+export interface AgentInstallRow {
+  id: string;
+  package_id: string;
+  agent_name: string;
+  date: string;
+  count: number;
+}
+
+export interface SearchDigestRow {
+  package_id: string;
+  full_name: string;
+  type: PackageType;
+  description: string;
+  summary: string;
+  keywords: string;
+  capabilities: string;
+  latest_version: string;
+  downloads: number;
+  trust_tier: TrustTier;
+  publisher_slug: string;
+  score: number;
+  updated_at: string;
+}
+
+export interface SyncProfileMeta {
+  user_id: string;
+  device_name: string;
+  package_count: number;
+  syncable_count: number;
+  unsyncable_count: number;
+  last_push_at: string | null;
+  last_pull_at: string | null;
+  last_push_device: string;
+  last_pull_device: string;
 }
 
 export interface ScannerCandidateRow {

@@ -16,7 +16,8 @@ interface SearchResult {
   summary: string;
   version: string;
   downloads: number;
-  repository: string;
+  trust_tier: string;
+  publisher_slug: string;
 }
 
 interface RankedItem {
@@ -62,15 +63,15 @@ async function searchFTS(
 ): Promise<RankedItem[]> {
   const sanitized = '"' + query.replace(/"/g, '""') + '"';
   let sql = `
-    SELECT p.id, p.full_name
+    SELECT sd.package_id as id, sd.full_name
     FROM packages_fts f
-    JOIN packages p ON p.rowid = f.rowid
+    JOIN search_digest sd ON sd.rowid = f.rowid
     WHERE packages_fts MATCH ?
   `;
   const params: unknown[] = [sanitized];
 
   if (type) {
-    sql += " AND p.type = ?";
+    sql += " AND sd.type = ?";
     params.push(type);
   }
 
@@ -121,7 +122,7 @@ async function searchVector(
       const ids = results.map((r) => r.id);
       const placeholders = ids.map(() => "?").join(",");
       const typeFiltered = await env.DB.prepare(
-        `SELECT id FROM packages WHERE id IN (${placeholders}) AND type = ?`
+        `SELECT id FROM packages WHERE id IN (${placeholders}) AND type = ? AND visibility = 'public' AND deleted_at IS NULL`
       ).bind(...ids, type).all();
 
       const validIds = new Set((typeFiltered.results ?? []).map((r) => r.id as string));
@@ -146,46 +147,32 @@ async function hydrateResults(
   const ids = packageIds.slice(0, limit);
   const placeholders = ids.map(() => "?").join(",");
 
-  // Fetch packages and latest versions in parallel (avoids N+1)
-  const [pkgResult, verResult] = await Promise.all([
-    db.prepare(
-      `SELECT id, full_name, type, description, summary, downloads, repository
-       FROM packages WHERE id IN (${placeholders})`
-    ).bind(...ids).all(),
-    db.prepare(
-      `SELECT package_id, version FROM versions
-       WHERE package_id IN (${placeholders}) AND yanked = 0
-       ORDER BY created_at DESC`
-    ).bind(...ids).all(),
-  ]);
+  // Use search_digest for fast hydration (only contains public packages)
+  const digestResult = await db.prepare(
+    `SELECT package_id, full_name, type, description, summary, latest_version,
+            downloads, trust_tier, publisher_slug
+     FROM search_digest WHERE package_id IN (${placeholders})`
+  ).bind(...ids).all();
 
-  const pkgMap = new Map<string, Record<string, unknown>>();
-  for (const row of pkgResult.results ?? []) {
-    pkgMap.set(row.id as string, row);
-  }
-
-  // Take the first (latest) version per package
-  const versionMap = new Map<string, string>();
-  for (const row of verResult.results ?? []) {
-    const pkgId = row.package_id as string;
-    if (!versionMap.has(pkgId)) {
-      versionMap.set(pkgId, row.version as string);
-    }
+  const digestMap = new Map<string, Record<string, unknown>>();
+  for (const row of digestResult.results ?? []) {
+    digestMap.set(row.package_id as string, row);
   }
 
   const results: SearchResult[] = [];
   for (const id of ids) {
-    const pkg = pkgMap.get(id);
-    if (!pkg) continue;
+    const sd = digestMap.get(id);
+    if (!sd) continue;
 
     results.push({
-      full_name: pkg.full_name as string,
-      type: pkg.type as string,
-      description: pkg.description as string,
-      summary: (pkg.summary as string) || "",
-      version: versionMap.get(id) ?? "",
-      downloads: pkg.downloads as number,
-      repository: (pkg.repository as string) ?? "",
+      full_name: sd.full_name as string,
+      type: sd.type as string,
+      description: sd.description as string,
+      summary: (sd.summary as string) || "",
+      version: (sd.latest_version as string) ?? "",
+      downloads: sd.downloads as number,
+      trust_tier: (sd.trust_tier as string) ?? "unverified",
+      publisher_slug: (sd.publisher_slug as string) ?? "",
     });
   }
 

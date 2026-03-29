@@ -4,6 +4,7 @@ import { generateId } from "../utils/response";
 import { hashToken } from "../services/auth";
 import { authMiddleware } from "../middleware/auth";
 import { badRequest, forbidden } from "../utils/errors";
+import { getOrCreatePublisher } from "../services/publisher";
 
 const app = new Hono<AppEnv>();
 
@@ -66,6 +67,9 @@ app.post("/v1/auth/token", async (c) => {
       ).bind(userId, data.username, data.email ?? "", data.github_id).run();
       user = { id: userId };
     }
+
+    // Auto-create personal publisher
+    await getOrCreatePublisher(c.env.DB, user.id as string, data.username);
 
     // Create API token
     await c.env.DB.prepare(
@@ -168,6 +172,9 @@ app.post("/v1/auth/github", async (c) => {
     await c.env.DB.prepare(
       "UPDATE users SET username = ?, email = ?, avatar_url = ?, updated_at = datetime('now') WHERE id = ?"
     ).bind(username, email, avatarUrl, user.id).run();
+
+    // Ensure publisher exists for returning users
+    await getOrCreatePublisher(c.env.DB, user.id as string, username);
   } else {
     const userId = generateId();
     await c.env.DB.prepare(
@@ -175,10 +182,11 @@ app.post("/v1/auth/github", async (c) => {
     ).bind(userId, username, email, avatarUrl, githubId).run();
     user = { id: userId };
 
-    // Auto-create user scope
+    // Auto-create personal publisher + user scope
+    const publisher = await getOrCreatePublisher(c.env.DB, userId, username);
     await c.env.DB.prepare(
-      "INSERT OR IGNORE INTO scopes (name, owner_type, owner_id) VALUES (?, 'user', ?)"
-    ).bind(username.toLowerCase(), user.id).run();
+      "INSERT OR IGNORE INTO scopes (name, owner_type, owner_id, publisher_id) VALUES (?, 'user', ?, ?)"
+    ).bind(username.toLowerCase(), userId, publisher.id).run();
   }
 
   // Generate session token

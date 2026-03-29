@@ -17,6 +17,10 @@ import scanner from "./routes/scanner";
 import orgs from "./routes/orgs";
 import versions from "./routes/versions";
 import categories from "./routes/categories";
+import tags from "./routes/tags";
+import stats from "./routes/stats";
+import publishers from "./routes/publishers";
+import sync from "./routes/sync";
 
 const app = new Hono<AppEnv>();
 
@@ -59,6 +63,10 @@ app.route("/", scanner);
 app.route("/", orgs);
 app.route("/", versions);
 app.route("/", categories);
+app.route("/", tags);
+app.route("/", stats);
+app.route("/", publishers);
+app.route("/", sync);
 
 // Root
 app.get("/", (c) => {

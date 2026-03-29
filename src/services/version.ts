@@ -8,6 +8,32 @@ export interface VersionRow {
   yanked: number;
 }
 
+/**
+ * Resolve a dist-tag constraint against the dist_tags table.
+ * Returns the version string if the constraint matches a tag, null otherwise.
+ */
+export async function resolveDistTag(
+  db: D1Database,
+  packageId: string,
+  constraint: string,
+): Promise<VersionRow | null> {
+  // Check if constraint matches a dist-tag name (not a semver pattern)
+  if (!constraint || /^[\^~>=<*]/.test(constraint) || /^\d+\./.test(constraint)) {
+    return null; // Not a dist-tag, it's a semver constraint
+  }
+
+  const tag = await db
+    .prepare(
+      `SELECT v.version, v.manifest, v.sha256, v.formula_key, v.yanked
+       FROM dist_tags dt JOIN versions v ON dt.version_id = v.id
+       WHERE dt.package_id = ? AND dt.tag = ?`,
+    )
+    .bind(packageId, constraint)
+    .first<VersionRow>();
+
+  return tag ?? null;
+}
+
 // Resolve a version constraint against available versions.
 export function resolveVersion(versions: VersionRow[], constraint: string): VersionRow | null {
   const nonYanked = versions.filter((v) => !v.yanked);

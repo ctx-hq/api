@@ -1,11 +1,14 @@
 import { Hono } from "hono";
 import type { AppEnv } from "../bindings";
 import { badRequest } from "../utils/errors";
+import { resolveDistTag } from "../services/version";
+import { optionalAuth } from "../middleware/auth";
+import { canAccessPackage } from "../services/publisher";
 
 const app = new Hono<AppEnv>();
 
 // Resolve version constraints
-app.post("/v1/resolve", async (c) => {
+app.post("/v1/resolve", optionalAuth, async (c) => {
   let body: { packages: Record<string, string> };
   try {
     body = await c.req.json();
@@ -17,14 +20,15 @@ app.post("/v1/resolve", async (c) => {
     throw badRequest("Request body must contain a 'packages' object");
   }
 
+  const user = c.get("user");
   const resolved: Record<string, unknown> = {};
 
   for (const [fullName, constraint] of Object.entries(body.packages)) {
     const pkg = await c.env.DB.prepare(
-      "SELECT id FROM packages WHERE full_name = ?"
+      "SELECT id, visibility, publisher_id FROM packages WHERE full_name = ? AND deleted_at IS NULL"
     ).bind(fullName).first();
 
-    if (!pkg) {
+    if (!pkg || !(await canAccessPackage(c.env.DB, user?.id ?? null, pkg))) {
       resolved[fullName] = { error: "not_found" };
       continue;
     }
@@ -40,14 +44,16 @@ app.post("/v1/resolve", async (c) => {
       continue;
     }
 
-    // Simple resolution: if constraint is "*" or "latest", return latest
-    // For semver constraints, match against available versions
+    // Try dist-tag resolution first (e.g., "latest", "beta", "stable")
     let matched: Record<string, unknown> | null = null;
 
-    if (constraint === "*" || constraint === "latest" || constraint === "") {
+    const distTagResult = await resolveDistTag(c.env.DB, pkg.id as string, constraint);
+    if (distTagResult) {
+      matched = distTagResult as unknown as Record<string, unknown>;
+    } else if (constraint === "*" || constraint === "latest" || constraint === "") {
       matched = rows[0] as Record<string, unknown>;
     } else {
-      // Basic semver matching (exact version)
+      // Semver matching (exact version)
       for (const row of rows) {
         const r = row as Record<string, unknown>;
         if (r.version === constraint) {
