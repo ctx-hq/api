@@ -1,20 +1,28 @@
 import { Hono } from "hono";
 import type { AppEnv } from "../bindings";
 import { getLatestVersion } from "../services/package";
+import { optionalAuth } from "../middleware/auth";
+import { canAccessPackage } from "../services/publisher";
 
 const app = new Hono<AppEnv>();
 
 // Agent-readable endpoint: GET /:fullName.ctx
 // Returns plain text install instructions that an agent can understand
-app.get("/:fullName{.+\\.ctx$}", async (c) => {
+app.get("/:fullName{.+\\.ctx$}", optionalAuth, async (c) => {
   const path = c.req.param("fullName");
   const fullName = path.replace(/\.ctx$/, "");
 
   const pkg = await c.env.DB.prepare(
-    "SELECT * FROM packages WHERE full_name = ?"
+    "SELECT id, full_name, type, description, license, visibility, publisher_id FROM packages WHERE full_name = ? AND deleted_at IS NULL"
   ).bind(fullName).first();
 
   if (!pkg) {
+    return c.text(`Package ${fullName} not found`, 404);
+  }
+
+  // Visibility guard: private packages require auth + membership
+  const user = c.get("user");
+  if (!(await canAccessPackage(c.env.DB, user?.id ?? null, pkg))) {
     return c.text(`Package ${fullName} not found`, 404);
   }
 
