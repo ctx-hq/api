@@ -2,23 +2,29 @@ import type { Context, Next } from "hono";
 import type { AppEnv } from "../bindings";
 import type { UserRow } from "../models/types";
 import { hashToken } from "../services/auth";
-import { forbidden } from "../utils/errors";
+import { AppError, forbidden, unauthorized } from "../utils/errors";
 
 export async function authMiddleware(c: Context<AppEnv>, next: Next) {
   const authHeader = c.req.header("Authorization");
   if (!authHeader?.startsWith("Bearer ")) {
-    return c.json({ error: "unauthorized", message: "Missing or invalid Authorization header" }, 401);
+    throw unauthorized("Missing or invalid Authorization header");
   }
 
   const token = authHeader.slice(7);
   const tokenHash = await hashToken(token);
 
-  const result = await c.env.DB.prepare(
-    "SELECT u.* FROM api_tokens t JOIN users u ON t.user_id = u.id WHERE t.token_hash = ? AND (t.expires_at IS NULL OR t.expires_at > datetime('now'))"
-  ).bind(tokenHash).first<UserRow>();
+  let result: UserRow | null;
+  try {
+    result = await c.env.DB.prepare(
+      "SELECT u.* FROM api_tokens t JOIN users u ON t.user_id = u.id WHERE t.token_hash = ? AND (t.expires_at IS NULL OR t.expires_at > datetime('now'))"
+    ).bind(tokenHash).first<UserRow>();
+  } catch (err) {
+    console.error("Auth middleware DB error:", err);
+    throw new AppError(503, "Authentication service temporarily unavailable", "service_unavailable");
+  }
 
   if (!result) {
-    return c.json({ error: "unauthorized", message: "Invalid or expired token" }, 401);
+    throw unauthorized("Invalid or expired token");
   }
 
   // Throttle last_used_at updates to once per hour
@@ -35,13 +41,18 @@ export async function authMiddleware(c: Context<AppEnv>, next: Next) {
 export async function optionalAuth(c: Context<AppEnv>, next: Next) {
   const authHeader = c.req.header("Authorization");
   if (authHeader?.startsWith("Bearer ")) {
-    const token = authHeader.slice(7);
-    const tokenHash = await hashToken(token);
-    const result = await c.env.DB.prepare(
-      "SELECT u.* FROM api_tokens t JOIN users u ON t.user_id = u.id WHERE t.token_hash = ? AND (t.expires_at IS NULL OR t.expires_at > datetime('now'))"
-    ).bind(tokenHash).first<UserRow>();
-    if (result) {
-      c.set("user", result);
+    try {
+      const token = authHeader.slice(7);
+      const tokenHash = await hashToken(token);
+      const result = await c.env.DB.prepare(
+        "SELECT u.* FROM api_tokens t JOIN users u ON t.user_id = u.id WHERE t.token_hash = ? AND (t.expires_at IS NULL OR t.expires_at > datetime('now'))"
+      ).bind(tokenHash).first<UserRow>();
+      if (result) {
+        c.set("user", result);
+      }
+    } catch (err) {
+      // Degrade to anonymous rather than failing the request
+      console.error("Optional auth DB error (degrading to anonymous):", err);
     }
   }
   await next();

@@ -256,7 +256,7 @@ app.patch("/v1/packages/:fullName/visibility", authMiddleware, async (c) => {
 });
 
 // Deprecate a package
-app.post("/v1/packages/:fullName/deprecate", authMiddleware, async (c) => {
+app.patch("/v1/packages/:fullName/deprecation", authMiddleware, async (c) => {
   const user = c.get("user");
   const fullName = decodeURIComponent(c.req.param("fullName")!);
 

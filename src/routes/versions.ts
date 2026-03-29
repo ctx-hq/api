@@ -35,7 +35,7 @@ app.get("/v1/packages/:fullName/resolve/:constraint", async (c) => {
     manifest: resolved.manifest,
     sha256: resolved.sha256,
     download_url: resolved.formula_key
-      ? `https://api.getctx.org/v1/download/${encodeURIComponent(fullName)}/${resolved.version}`
+      ? `https://api.getctx.org/v1/packages/${encodeURIComponent(fullName)}/versions/${resolved.version}/archive`
       : "",
   });
 });

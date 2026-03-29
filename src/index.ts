@@ -78,6 +78,11 @@ app.get("/", (c) => {
   });
 });
 
+// 404 handler — consistent JSON format for unmatched routes
+app.notFound((c) => {
+  return c.json({ error: "not_found", message: "Route not found" }, 404);
+});
+
 // Scheduled handler (scanner cron) and queue consumer
 export default {
   fetch: app.fetch,

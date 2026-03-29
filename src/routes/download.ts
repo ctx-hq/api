@@ -8,7 +8,7 @@ import { canAccessPackage } from "../services/publisher";
 const app = new Hono<AppEnv>();
 
 // Download formula archive
-app.get("/v1/download/:fullName/:version", optionalAuth, async (c) => {
+app.get("/v1/packages/:fullName/versions/:version/archive", optionalAuth, async (c) => {
   const fullName = decodeURIComponent(c.req.param("fullName")!);
   const version = c.req.param("version")!;
 

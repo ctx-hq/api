@@ -15,7 +15,7 @@ import { parse as parseYAML } from "yaml";
 const app = new Hono<AppEnv>();
 
 // Publish a package
-app.post("/v1/publish", authMiddleware, async (c) => {
+app.post("/v1/packages", authMiddleware, async (c) => {
   const user = c.get("user");
   const formData = await c.req.formData();
   const manifestFile = formData.get("manifest");
@@ -249,7 +249,7 @@ app.post("/v1/publish", authMiddleware, async (c) => {
 });
 
 // Yank a version
-app.post("/v1/yank/:fullName/:version", authMiddleware, async (c) => {
+app.post("/v1/packages/:fullName/versions/:version/yank", authMiddleware, async (c) => {
   const user = c.get("user");
   const fullName = decodeURIComponent(c.req.param("fullName")!);
   const version = c.req.param("version")!;

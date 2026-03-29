@@ -69,7 +69,7 @@ app.post("/v1/resolve", optionalAuth, async (c) => {
 
     if (matched) {
       const downloadUrl = matched.formula_key
-        ? `https://api.getctx.org/v1/download/${encodeURIComponent(fullName)}/${matched.version}`
+        ? `https://api.getctx.org/v1/packages/${encodeURIComponent(fullName)}/versions/${matched.version}/archive`
         : "";
 
       resolved[fullName] = {
