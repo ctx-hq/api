@@ -21,6 +21,10 @@ import tags from "./routes/tags";
 import stats from "./routes/stats";
 import publishers from "./routes/publishers";
 import sync from "./routes/sync";
+import transfers from "./routes/transfers";
+import notifications from "./routes/notifications";
+import { resolvePackageName } from "./services/redirect";
+import { cleanupOldNotifications } from "./services/notification";
 
 const app = new Hono<AppEnv>();
 
@@ -28,15 +32,42 @@ const app = new Hono<AppEnv>();
 app.use("*", securityHeaders);
 app.use("/v1/*", rateLimitMiddleware);
 
-// Probabilistic audit log cleanup (~1% of requests, non-blocking)
+// Package redirect middleware: resolve slug aliases for renamed/transferred packages
+// The {.+} pattern captures everything after /v1/packages/, including sub-routes like
+// /versions/1.0.0. We extract only the @scope/name portion for alias lookup.
+app.use("/v1/packages/:fullName{.+}", async (c, next) => {
+  const raw = c.req.param("fullName");
+  if (!raw) return next();
+  const decoded = decodeURIComponent(raw);
+  if (!decoded.startsWith("@")) return next();
+
+  // Extract @scope/name from potentially longer paths like @scope/name/versions/1.0.0
+  const match = decoded.match(/^(@[^/]+\/[^/]+)/);
+  if (!match) return next();
+  const fullName = match[1];
+
+  const canonical = await resolvePackageName(c.env.DB, fullName);
+  if (canonical !== fullName) {
+    const encodedOld = encodeURIComponent(fullName);
+    const encodedNew = encodeURIComponent(canonical);
+    const newPath = c.req.path.replace(encodedOld, encodedNew);
+    return c.json({ redirect: canonical, location: newPath }, 301);
+  }
+  return next();
+});
+
+// Probabilistic cleanup (~1% of requests, non-blocking)
 // Runs inline because free-plan cron slots are limited
 app.use("/v1/*", async (c, next) => {
   await next();
   if (Math.random() < 0.01) {
     c.executionCtx.waitUntil(
-      c.env.DB.prepare(
-        "DELETE FROM audit_events WHERE created_at < datetime('now', '-90 days') LIMIT 1000"
-      ).run()
+      Promise.all([
+        c.env.DB.prepare(
+          "DELETE FROM audit_events WHERE created_at < datetime('now', '-90 days') LIMIT 1000"
+        ).run(),
+        cleanupOldNotifications(c.env.DB),
+      ])
     );
   }
 });
@@ -67,6 +98,8 @@ app.route("/", tags);
 app.route("/", stats);
 app.route("/", publishers);
 app.route("/", sync);
+app.route("/", transfers);
+app.route("/", notifications);
 app.route("/", root);
 
 // 404 handler — consistent JSON format for unmatched routes

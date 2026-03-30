@@ -1,13 +1,14 @@
 import { Hono } from "hono";
 import type { AppEnv } from "../bindings";
-import type { Visibility } from "../models/types";
+import type { Visibility, PublisherRow } from "../models/types";
 import { notFound, badRequest, forbidden } from "../utils/errors";
 import { getLatestVersion } from "../services/package";
 import { authMiddleware, optionalAuth } from "../middleware/auth";
 import { canPublish, getPublisherForScope, canAccessPackage } from "../services/publisher";
-import { parseFullName } from "../utils/naming";
+import { parseFullName, isValidScope } from "../utils/naming";
 import { upsertSearchDigest } from "../services/publish";
 import { getPackageAccess, grantPackageAccess, revokePackageAccess } from "../services/package-access";
+import { renamePackage } from "../services/rename";
 
 const app = new Hono<AppEnv>();
 
@@ -458,6 +459,75 @@ app.patch("/v1/packages/:fullName/access", authMiddleware, async (c) => {
   }
 
   return c.json({ added: body.add ?? [], removed: body.remove ?? [] });
+});
+
+// Rename package (name portion only, within same scope)
+app.patch("/v1/packages/:fullName/rename", authMiddleware, async (c) => {
+  const user = c.get("user");
+  const fullName = c.req.param("fullName");
+
+  let body: { new_name: string; confirm: string };
+  try {
+    body = await c.req.json();
+  } catch {
+    throw badRequest("Invalid JSON body");
+  }
+
+  if (!body.new_name) throw badRequest("new_name is required");
+  if (!isValidScope(body.new_name)) {
+    throw badRequest("Invalid package name (lowercase, alphanumeric, hyphens)");
+  }
+  if (body.confirm !== fullName) {
+    throw badRequest(`Confirmation required: pass "confirm": "${fullName}" to proceed`);
+  }
+
+  const pkg = await c.env.DB.prepare(
+    "SELECT id, publisher_id, scope, name, full_name FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+  ).bind(fullName).first<{ id: string; publisher_id: string; scope: string; name: string; full_name: string }>();
+
+  if (!pkg) throw notFound(`Package ${fullName} not found`);
+
+  // Check permission (must be able to publish to this scope)
+  const publisher = await c.env.DB.prepare(
+    "SELECT * FROM publishers WHERE id = ?",
+  ).bind(pkg.publisher_id).first<PublisherRow>();
+
+  if (!publisher) throw notFound("Publisher not found");
+
+  const hasPermission = await canPublish(c.env.DB, user.id, publisher);
+  if (!hasPermission) throw forbidden("You don't have permission to rename this package");
+
+  // For org packages, only owner/admin can rename
+  if (publisher.kind === "org" && publisher.org_id) {
+    const membership = await c.env.DB.prepare(
+      "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+    ).bind(publisher.org_id, user.id).first<{ role: string }>();
+
+    if (!membership || !["owner", "admin"].includes(membership.role)) {
+      throw forbidden("Only org owners and admins can rename packages");
+    }
+  }
+
+  try {
+    const result = await renamePackage(c.env.DB, pkg.id, body.new_name);
+
+    // Audit
+    await c.env.DB.prepare(
+      "INSERT INTO audit_events (id, action, actor_id, target_type, target_id, metadata) VALUES (?, 'package.rename', ?, 'package', ?, ?)",
+    ).bind(
+      `evt-${crypto.randomUUID().replace(/-/g, "")}`,
+      user.id,
+      pkg.id,
+      JSON.stringify({ old_name: result.oldFullName, new_name: result.newFullName }),
+    ).run();
+
+    return c.json({
+      old_name: result.oldFullName,
+      new_name: result.newFullName,
+    });
+  } catch (e: any) {
+    throw badRequest(e.message);
+  }
 });
 
 export default app;

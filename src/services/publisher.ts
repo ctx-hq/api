@@ -133,9 +133,44 @@ export async function getPublisherForScope(
  * Check if a user can publish to a publisher's scope.
  *
  * - User publisher: user_id must match
- * - Org publisher: user must be a member of the org
+ * - Org publisher: user must be a member of the org AND org must be active (not archived)
  */
 export async function canPublish(
+  db: D1Database,
+  userId: string,
+  publisher: PublisherRow,
+): Promise<boolean> {
+  if (publisher.kind === "user") {
+    return publisher.user_id === userId;
+  }
+
+  if (publisher.kind === "org" && publisher.org_id) {
+    // Check org is not archived
+    const org = await db
+      .prepare("SELECT status FROM orgs WHERE id = ?")
+      .bind(publisher.org_id)
+      .first<{ status: string }>();
+
+    if (org?.status === "archived") return false;
+
+    const membership = await db
+      .prepare(
+        "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+      )
+      .bind(publisher.org_id, userId)
+      .first<{ role: string }>();
+
+    return membership !== null;
+  }
+
+  return false;
+}
+
+/**
+ * Check if a user can publish (without archive check — for access control only).
+ * Use this for read-access checks where archived orgs should still allow access.
+ */
+export async function isMemberOfPublisher(
   db: D1Database,
   userId: string,
   publisher: PublisherRow,

@@ -3,8 +3,9 @@ import type { AppEnv } from "../bindings";
 import { generateId } from "../utils/response";
 import { hashToken } from "../services/auth";
 import { authMiddleware } from "../middleware/auth";
-import { badRequest, forbidden } from "../utils/errors";
+import { badRequest, forbidden, notFound } from "../utils/errors";
 import { getOrCreatePublisher } from "../services/publisher";
+import { renameUser, checkRenameCooldown, isNameAvailable } from "../services/rename";
 
 const app = new Hono<AppEnv>();
 
@@ -398,6 +399,57 @@ app.delete("/v1/me", authMiddleware, async (c) => {
   ]);
 
   return c.json({ deleted: true });
+});
+
+// Rename user (self only, 30-day cooldown)
+app.patch("/v1/me/rename", authMiddleware, async (c) => {
+  const user = c.get("user");
+
+  let body: { new_username: string; confirm: string };
+  try {
+    body = await c.req.json();
+  } catch {
+    throw badRequest("Invalid JSON body");
+  }
+
+  if (!body.new_username) throw badRequest("new_username is required");
+  if (body.confirm !== user.username) {
+    throw badRequest(`Confirmation required: pass "confirm": "${user.username}" to proceed`);
+  }
+
+  // Check cooldown
+  const onCooldown = await checkRenameCooldown(c.env.DB, "users", user.id);
+  if (onCooldown) {
+    throw badRequest("You renamed your account recently. Please wait 30 days between renames.");
+  }
+
+  // Check availability
+  const availability = await isNameAvailable(c.env.DB, body.new_username);
+  if (!availability.available) {
+    throw badRequest(availability.reason!);
+  }
+
+  try {
+    const result = await renameUser(c.env.DB, user.id, body.new_username);
+
+    // Audit
+    await c.env.DB.prepare(
+      "INSERT INTO audit_events (id, action, actor_id, target_type, target_id, metadata) VALUES (?, 'user.rename', ?, 'user', ?, ?)",
+    ).bind(
+      generateId(),
+      user.id,
+      user.id,
+      JSON.stringify({ old_username: result.oldUsername, new_username: result.newUsername }),
+    ).run();
+
+    return c.json({
+      old_username: result.oldUsername,
+      new_username: result.newUsername,
+      packages_updated: result.packagesUpdated,
+    });
+  } catch (e: any) {
+    throw badRequest(e.message);
+  }
 });
 
 export default app;

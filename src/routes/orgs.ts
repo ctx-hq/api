@@ -4,8 +4,14 @@ import { authMiddleware, optionalAuth } from "../middleware/auth";
 import { badRequest, notFound, forbidden, conflict } from "../utils/errors";
 import { isValidScope } from "../utils/naming";
 import { generateId } from "../utils/response";
-import { createOrgPublisher, getPublisherForScope, canPublish } from "../services/publisher";
+import { createOrgPublisher, getPublisherForScope, canPublish, isMemberOfPublisher } from "../services/publisher";
 import type { InvitationStatus } from "../models/types";
+import { renameOrg } from "../services/rename";
+import { checkRenameCooldown, isNameAvailable } from "../services/rename";
+import { cancelPackageTransfers } from "../services/transfer";
+import { flattenPackageAliasChains } from "../services/redirect";
+import type { PublisherRow } from "../models/types";
+import { notify, notifyPublisherOwners } from "../services/notification";
 import {
   createInvitation,
   listOrgInvitations,
@@ -81,7 +87,7 @@ app.get("/v1/orgs/:name", optionalAuth, async (c) => {
   // Package count: respect package_access restrictions for non-owner/admin members
   const user = c.get("user");
   const publisher = await getPublisherForScope(c.env.DB, name!);
-  const isMember = user && publisher ? await canPublish(c.env.DB, user.id, publisher) : false;
+  const isMember = user && publisher ? await isMemberOfPublisher(c.env.DB, user.id, publisher) : false;
 
   let packageCount: Record<string, unknown> | null;
   if (!isMember) {
@@ -266,7 +272,7 @@ app.get("/v1/orgs/:name/packages", optionalAuth, async (c) => {
   // regular members unless they have an explicit grant.
   const user = c.get("user");
   const publisher = await getPublisherForScope(c.env.DB, name!);
-  const isMember = user && publisher ? await canPublish(c.env.DB, user.id, publisher) : false;
+  const isMember = user && publisher ? await isMemberOfPublisher(c.env.DB, user.id, publisher) : false;
 
   const conditions: string[] = ["scope = ?", "deleted_at IS NULL"];
   const params: unknown[] = [name];
@@ -494,6 +500,16 @@ app.post("/v1/orgs/:name/invitations", authMiddleware, async (c) => {
     role,
   );
 
+  // Notify invitee
+  await notify(
+    c.env.DB,
+    targetUser.id as string,
+    "org_invitation",
+    `Invitation to join @${name}`,
+    `${user.username} invited you to join @${name} as ${role}`,
+    { org_name: name, inviter: user.username, role, invitation_id: invitation.id },
+  );
+
   return c.json({
     id: invitation.id,
     org_name: name,
@@ -581,6 +597,19 @@ app.post("/v1/me/invitations/:id/accept", authMiddleware, async (c) => {
     .bind(result.org_id)
     .first<{ name: string }>();
 
+  // Notify org owners that a new member joined
+  const publisher = await getPublisherForScope(c.env.DB, org?.name ?? "");
+  if (publisher) {
+    await notifyPublisherOwners(
+      c.env.DB,
+      publisher.id,
+      "member_joined",
+      `${user.username} joined @${org?.name}`,
+      `${user.username} accepted the invitation and joined as ${result.role}`,
+      { org_name: org?.name, username: user.username, role: result.role },
+    );
+  }
+
   return c.json({
     accepted: invitationId,
     org_name: org?.name ?? "unknown",
@@ -652,6 +681,354 @@ app.get("/v1/orgs/:name/public-members", async (c) => {
   ).bind(org.id).all();
 
   return c.json({ members: members.results ?? [] });
+});
+
+// ============================================================
+// ORG LIFECYCLE ROUTES
+// ============================================================
+
+// Member self-leave
+app.post("/v1/orgs/:name/leave", authMiddleware, async (c) => {
+  const user = c.get("user");
+  const name = c.req.param("name");
+
+  const org = await c.env.DB.prepare("SELECT id FROM orgs WHERE name = ?").bind(name).first();
+  if (!org) throw notFound(`Organization @${name} not found`);
+
+  const membership = await c.env.DB.prepare(
+    "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+  ).bind(org.id, user.id).first<{ role: string }>();
+
+  if (!membership) throw notFound("You are not a member of this organization");
+
+  // Prevent last owner from leaving
+  if (membership.role === "owner") {
+    const ownerCount = await c.env.DB.prepare(
+      "SELECT COUNT(*) as count FROM org_members WHERE org_id = ? AND role = 'owner'",
+    ).bind(org.id).first<{ count: number }>();
+
+    if ((ownerCount?.count ?? 0) <= 1) {
+      throw badRequest("Cannot leave: you are the last owner. Transfer ownership first.");
+    }
+  }
+
+  // Cascade cleanup (same as member removal)
+  await Promise.all([
+    cleanupUserAccessForOrg(c.env.DB, user.id, org.id as string),
+    cancelUserInvitations(c.env.DB, org.id as string, user.id),
+  ]);
+
+  await c.env.DB.prepare(
+    "DELETE FROM org_members WHERE org_id = ? AND user_id = ?",
+  ).bind(org.id, user.id).run();
+
+  // Notify org owners
+  const publisher = await getPublisherForScope(c.env.DB, name!);
+  if (publisher) {
+    await notifyPublisherOwners(
+      c.env.DB,
+      publisher.id,
+      "member_left",
+      `${user.username} left @${name}`,
+      `${user.username} has left the organization`,
+      { org_name: name, username: user.username },
+    );
+  }
+
+  return c.json({ left: name });
+});
+
+// Archive org (freeze publishing)
+app.post("/v1/orgs/:name/archive", authMiddleware, async (c) => {
+  const user = c.get("user");
+  const name = c.req.param("name");
+
+  const org = await c.env.DB.prepare("SELECT id, status FROM orgs WHERE name = ?").bind(name).first();
+  if (!org) throw notFound(`Organization @${name} not found`);
+
+  const membership = await c.env.DB.prepare(
+    "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+  ).bind(org.id, user.id).first();
+
+  if (!membership || membership.role !== "owner") {
+    throw forbidden("Only owners can archive the organization");
+  }
+
+  if (org.status === "archived") {
+    throw badRequest("Organization is already archived");
+  }
+
+  await c.env.DB.prepare(
+    "UPDATE orgs SET status = 'archived', archived_at = datetime('now') WHERE id = ?",
+  ).bind(org.id).run();
+
+  return c.json({ archived: name });
+});
+
+// Unarchive org
+app.post("/v1/orgs/:name/unarchive", authMiddleware, async (c) => {
+  const user = c.get("user");
+  const name = c.req.param("name");
+
+  const org = await c.env.DB.prepare("SELECT id, status FROM orgs WHERE name = ?").bind(name).first();
+  if (!org) throw notFound(`Organization @${name} not found`);
+
+  const membership = await c.env.DB.prepare(
+    "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+  ).bind(org.id, user.id).first();
+
+  if (!membership || membership.role !== "owner") {
+    throw forbidden("Only owners can unarchive the organization");
+  }
+
+  if (org.status !== "archived") {
+    throw badRequest("Organization is not archived");
+  }
+
+  await c.env.DB.prepare(
+    "UPDATE orgs SET status = 'active', archived_at = NULL WHERE id = ?",
+  ).bind(org.id).run();
+
+  return c.json({ unarchived: name });
+});
+
+// Rename org (dangerous — type-to-confirm + 30-day cooldown)
+app.patch("/v1/orgs/:name/rename", authMiddleware, async (c) => {
+  const user = c.get("user");
+  const name = c.req.param("name");
+
+  let body: { new_name: string; confirm: string };
+  try {
+    body = await c.req.json();
+  } catch {
+    throw badRequest("Invalid JSON body");
+  }
+
+  if (!body.new_name) throw badRequest("new_name is required");
+  if (body.confirm !== name) {
+    throw badRequest(`Confirmation required: pass "confirm": "${name}" to proceed`);
+  }
+
+  const org = await c.env.DB.prepare("SELECT id, name FROM orgs WHERE name = ?").bind(name).first();
+  if (!org) throw notFound(`Organization @${name} not found`);
+
+  const membership = await c.env.DB.prepare(
+    "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+  ).bind(org.id, user.id).first();
+
+  if (!membership || membership.role !== "owner") {
+    throw forbidden("Only owners can rename the organization");
+  }
+
+  // Check cooldown
+  const onCooldown = await checkRenameCooldown(c.env.DB, "orgs", org.id as string);
+  if (onCooldown) {
+    throw badRequest("Organization was renamed recently. Please wait 30 days between renames.");
+  }
+
+  // Check name availability
+  const availability = await isNameAvailable(c.env.DB, body.new_name);
+  if (!availability.available) {
+    throw badRequest(availability.reason!);
+  }
+
+  const result = await renameOrg(c.env.DB, org.id as string, body.new_name);
+
+  // Audit
+  await c.env.DB.prepare(
+    "INSERT INTO audit_events (id, action, actor_id, target_type, target_id, metadata) VALUES (?, 'org.rename', ?, 'org', ?, ?)",
+  ).bind(
+    `evt-${crypto.randomUUID().replace(/-/g, "")}`,
+    user.id,
+    org.id,
+    JSON.stringify({ old_name: result.oldName, new_name: result.newName, packages_updated: result.packagesUpdated }),
+  ).run();
+
+  return c.json({
+    old_name: result.oldName,
+    new_name: result.newName,
+    packages_updated: result.packagesUpdated,
+  });
+});
+
+// Dissolve org (dangerous — must handle all packages first)
+app.post("/v1/orgs/:name/dissolve", authMiddleware, async (c) => {
+  const user = c.get("user");
+  const name = c.req.param("name");
+
+  let body: { action: "transfer_all" | "delete_all"; transfer_to?: string; confirm: string };
+  try {
+    body = await c.req.json();
+  } catch {
+    throw badRequest("Invalid JSON body");
+  }
+
+  if (!["transfer_all", "delete_all"].includes(body.action)) {
+    throw badRequest('action must be "transfer_all" or "delete_all"');
+  }
+
+  if (body.confirm !== name) {
+    throw badRequest(`Confirmation required: pass "confirm": "${name}" to proceed`);
+  }
+
+  const org = await c.env.DB.prepare("SELECT id FROM orgs WHERE name = ?").bind(name).first();
+  if (!org) throw notFound(`Organization @${name} not found`);
+
+  const membership = await c.env.DB.prepare(
+    "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+  ).bind(org.id, user.id).first();
+
+  if (!membership || membership.role !== "owner") {
+    throw forbidden("Only owners can dissolve the organization");
+  }
+
+  // Get all packages
+  const packages = await c.env.DB.prepare(
+    "SELECT id, name, full_name, publisher_id FROM packages WHERE scope = ? AND deleted_at IS NULL",
+  ).bind(name).all<{ id: string; name: string; full_name: string; publisher_id: string }>();
+
+  const pkgs = packages.results ?? [];
+
+  if (body.action === "transfer_all") {
+    if (!body.transfer_to) {
+      throw badRequest("transfer_to is required when action is transfer_all");
+    }
+
+    const targetScope = body.transfer_to.startsWith("@") ? body.transfer_to.slice(1) : body.transfer_to;
+
+    // Find target publisher
+    const toPublisher = await c.env.DB.prepare(
+      "SELECT * FROM publishers WHERE slug = ?",
+    ).bind(targetScope).first<PublisherRow>();
+
+    if (!toPublisher) throw notFound(`Target scope @${targetScope} not found`);
+    if (toPublisher.org_id === org.id) throw badRequest("Cannot transfer packages to the org being dissolved");
+
+    // Check if caller is also owner of target scope (auto-accept) or create transfer requests
+    const callerOwnsTarget = await canPublish(c.env.DB, user.id, toPublisher);
+
+    if (callerOwnsTarget) {
+      // Auto-accept: directly move all packages
+      for (const pkg of pkgs) {
+        const newFullName = `@${targetScope}/${pkg.name}`;
+
+        // Check for name collision
+        const collision = await c.env.DB.prepare(
+          "SELECT id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+        ).bind(newFullName).first();
+
+        if (collision) {
+          throw conflict(`Cannot transfer: package ${newFullName} already exists at target scope`);
+        }
+      }
+
+      // Ensure target scope exists
+      const existingScope = await c.env.DB.prepare(
+        "SELECT name FROM scopes WHERE name = ?",
+      ).bind(targetScope).first();
+
+      if (!existingScope) {
+        await c.env.DB.prepare(
+          "INSERT INTO scopes (name, owner_type, owner_id, publisher_id) VALUES (?, ?, ?, ?)",
+        ).bind(
+          targetScope,
+          toPublisher.kind === "user" ? "user" : "org",
+          toPublisher.kind === "user" ? toPublisher.user_id : toPublisher.org_id,
+          toPublisher.id,
+        ).run();
+      }
+
+      // Cancel pending transfers for all packages first
+      for (const pkg of pkgs) {
+        await cancelPackageTransfers(c.env.DB, pkg.id);
+      }
+
+      // Batch all package moves + alias creation + alias chain flattening
+      const stmts: D1PreparedStatement[] = [];
+      for (const pkg of pkgs) {
+        const newFullName = `@${targetScope}/${pkg.name}`;
+
+        stmts.push(
+          c.env.DB.prepare(
+            "UPDATE packages SET scope = ?, full_name = ?, publisher_id = ?, updated_at = datetime('now') WHERE id = ?",
+          ).bind(targetScope, newFullName, toPublisher.id, pkg.id),
+          c.env.DB.prepare(
+            "INSERT OR REPLACE INTO slug_aliases (old_full_name, new_full_name) VALUES (?, ?)",
+          ).bind(pkg.full_name, newFullName),
+          c.env.DB.prepare(
+            "UPDATE search_digest SET full_name = ?, publisher_slug = ?, updated_at = datetime('now') WHERE package_id = ?",
+          ).bind(newFullName, targetScope, pkg.id),
+          c.env.DB.prepare(
+            "DELETE FROM package_access WHERE package_id = ?",
+          ).bind(pkg.id),
+          // Flatten existing alias chains pointing to old name
+          c.env.DB.prepare(
+            "UPDATE slug_aliases SET new_full_name = ? WHERE new_full_name = ?",
+          ).bind(newFullName, pkg.full_name),
+        );
+      }
+
+      // D1 batch limit is ~100 statements; chunk if needed
+      const BATCH_SIZE = 90;
+      for (let i = 0; i < stmts.length; i += BATCH_SIZE) {
+        await c.env.DB.batch(stmts.slice(i, i + BATCH_SIZE));
+      }
+    } else {
+      throw badRequest(
+        "You are not an owner of the target scope. Transfer packages individually first, then delete the empty org.",
+      );
+    }
+  } else {
+    // delete_all: cancel transfers then soft-delete all packages
+    for (const pkg of pkgs) {
+      await cancelPackageTransfers(c.env.DB, pkg.id);
+    }
+
+    const deleteStmts: D1PreparedStatement[] = [];
+    for (const pkg of pkgs) {
+      deleteStmts.push(
+        c.env.DB.prepare(
+          "UPDATE packages SET deleted_at = datetime('now') WHERE id = ?",
+        ).bind(pkg.id),
+        c.env.DB.prepare(
+          "DELETE FROM search_digest WHERE package_id = ?",
+        ).bind(pkg.id),
+        c.env.DB.prepare(
+          "DELETE FROM package_access WHERE package_id = ?",
+        ).bind(pkg.id),
+      );
+    }
+
+    const BATCH_SIZE = 90;
+    for (let i = 0; i < deleteStmts.length; i += BATCH_SIZE) {
+      await c.env.DB.batch(deleteStmts.slice(i, i + BATCH_SIZE));
+    }
+  }
+
+  // Now delete the org (same as existing delete logic)
+  await c.env.DB.batch([
+    c.env.DB.prepare("DELETE FROM org_invitations WHERE org_id = ?").bind(org.id),
+    c.env.DB.prepare("DELETE FROM org_members WHERE org_id = ?").bind(org.id),
+    c.env.DB.prepare("DELETE FROM scopes WHERE name = ?").bind(name),
+    c.env.DB.prepare("DELETE FROM publishers WHERE org_id = ?").bind(org.id),
+    c.env.DB.prepare("DELETE FROM orgs WHERE id = ?").bind(org.id),
+  ]);
+
+  // Audit
+  await c.env.DB.prepare(
+    "INSERT INTO audit_events (id, action, actor_id, target_type, target_id, metadata) VALUES (?, 'org.dissolve', ?, 'org', ?, ?)",
+  ).bind(
+    `evt-${crypto.randomUUID().replace(/-/g, "")}`,
+    user.id,
+    org.id,
+    JSON.stringify({ action: body.action, packages: pkgs.length, transfer_to: body.transfer_to }),
+  ).run();
+
+  return c.json({
+    dissolved: name,
+    action: body.action,
+    packages_affected: pkgs.length,
+  });
 });
 
 export default app;

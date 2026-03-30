@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import type { AppEnv } from "../bindings";
 import { notFound } from "../utils/errors";
 import { optionalAuth } from "../middleware/auth";
-import { getPublisherBySlug, canPublish } from "../services/publisher";
+import { getPublisherBySlug, isMemberOfPublisher } from "../services/publisher";
 
 const app = new Hono<AppEnv>();
 
@@ -15,7 +15,7 @@ app.get("/v1/publishers/:slug", optionalAuth, async (c) => {
 
   // Members see total count; others see only public count
   const user = c.get("user");
-  const isMember = user ? await canPublish(c.env.DB, user.id, publisher) : false;
+  const isMember = user ? await isMemberOfPublisher(c.env.DB, user.id, publisher) : false;
   const countWhere = isMember
     ? "publisher_id = ? AND deleted_at IS NULL"
     : "publisher_id = ? AND visibility = 'public' AND deleted_at IS NULL";
@@ -47,7 +47,7 @@ app.get("/v1/publishers/:slug/packages", optionalAuth, async (c) => {
 
   // Members see all visibility levels; others see only public
   const user = c.get("user");
-  const isMember = user ? await canPublish(c.env.DB, user.id, publisher) : false;
+  const isMember = user ? await isMemberOfPublisher(c.env.DB, user.id, publisher) : false;
 
   const conditions: string[] = ["p.publisher_id = ?", "p.deleted_at IS NULL"];
   const baseParams: unknown[] = [publisher.id];

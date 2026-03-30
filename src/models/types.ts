@@ -91,12 +91,17 @@ export interface UserRow {
   updated_at: string;
 }
 
+export type OrgStatus = "active" | "archived";
+
 export interface OrgRow {
   id: string;
   name: string;
   display_name: string;
+  status: OrgStatus;
   created_by: string;
   created_at: string;
+  archived_at: string | null;
+  renamed_at: string | null;
 }
 
 export type Visibility = "public" | "unlisted" | "private";
@@ -191,6 +196,48 @@ export interface OrgInvitationRow {
 }
 
 export type MemberVisibility = "public" | "private";
+
+// --- Transfer types ---
+
+export type TransferStatus = "pending" | "accepted" | "declined" | "expired" | "cancelled";
+
+export interface TransferRequestRow {
+  id: string;
+  package_id: string;
+  from_publisher_id: string;
+  to_publisher_id: string;
+  initiated_by: string;
+  status: TransferStatus;
+  message: string;
+  expires_at: string;
+  created_at: string;
+  resolved_at: string | null;
+  resolved_by: string | null;
+}
+
+// --- Notification types ---
+
+export type NotificationType =
+  | "org_invitation"
+  | "transfer_request"
+  | "transfer_completed"
+  | "member_joined"
+  | "member_left"
+  | "package_deprecated"
+  | "security_alert"
+  | "system_notice";
+
+export interface NotificationRow {
+  id: string;
+  user_id: string;
+  type: NotificationType;
+  title: string;
+  body: string;
+  data: string;
+  read: number;
+  dismissed: number;
+  created_at: string;
+}
 
 export interface PackageAccessRow {
   package_id: string;
