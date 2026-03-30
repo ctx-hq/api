@@ -7,6 +7,7 @@ import { authMiddleware, optionalAuth } from "../middleware/auth";
 import { canPublish, getPublisherForScope, canAccessPackage } from "../services/publisher";
 import { parseFullName, isValidScope } from "../utils/naming";
 import { upsertSearchDigest } from "../services/publish";
+import { parseSemVer, compareSemVer } from "../utils/semver";
 import { getPackageAccess, grantPackageAccess, revokePackageAccess } from "../services/package-access";
 import { renamePackage } from "../services/rename";
 
@@ -321,14 +322,14 @@ app.patch("/v1/packages/:fullName/deprecation", authMiddleware, async (c) => {
   return c.json({ full_name: fullName, deprecated: true, message: body.message });
 });
 
-// Soft-delete a package
+// Delete a package (hard delete — removes all versions, metadata, and archives)
 app.delete("/v1/packages/:fullName", authMiddleware, async (c) => {
   const user = c.get("user");
   const fullName = decodeURIComponent(c.req.param("fullName")!);
 
   const pkg = await c.env.DB.prepare(
     "SELECT id, publisher_id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
-  ).bind(fullName).first();
+  ).bind(fullName).first<{ id: string; publisher_id: string }>();
   if (!pkg) throw notFound(`Package ${fullName} not found`);
 
   const parsed = parseFullName(fullName);
@@ -338,12 +339,187 @@ app.delete("/v1/packages/:fullName", authMiddleware, async (c) => {
     throw forbidden("You don't have permission to delete this package");
   }
 
-  await c.env.DB.batch([
-    c.env.DB.prepare("UPDATE packages SET deleted_at = datetime('now'), updated_at = datetime('now') WHERE id = ?").bind(pkg.id),
-    c.env.DB.prepare("DELETE FROM search_digest WHERE package_id = ?").bind(pkg.id),
+  // Collect R2 keys and vector chunk IDs for cleanup
+  const versions = await c.env.DB.prepare(
+    "SELECT id, formula_key FROM versions WHERE package_id = ?",
+  ).bind(pkg.id).all<{ id: string; formula_key: string }>();
+
+  const versionIds = (versions.results ?? []).map(v => v.id);
+  const formulaKeys = (versions.results ?? []).map(v => v.formula_key).filter(Boolean);
+
+  const vectorChunks = await c.env.DB.prepare(
+    "SELECT id FROM vector_chunks WHERE package_id = ?",
+  ).bind(pkg.id).all<{ id: string }>();
+  const vectorChunkIds = (vectorChunks.results ?? []).map(r => r.id);
+
+  // Hard delete: metadata → versions → dist-tags → access → search → stats → vectors → package
+  const stmts: D1PreparedStatement[] = [];
+  for (const vid of versionIds) {
+    stmts.push(c.env.DB.prepare("DELETE FROM skill_metadata WHERE version_id = ?").bind(vid));
+    stmts.push(c.env.DB.prepare("DELETE FROM mcp_metadata WHERE version_id = ?").bind(vid));
+    stmts.push(c.env.DB.prepare("DELETE FROM cli_metadata WHERE version_id = ?").bind(vid));
+    stmts.push(c.env.DB.prepare("DELETE FROM install_metadata WHERE version_id = ?").bind(vid));
+    stmts.push(c.env.DB.prepare("DELETE FROM trust_checks WHERE version_id = ?").bind(vid));
+  }
+  stmts.push(c.env.DB.prepare("DELETE FROM versions WHERE package_id = ?").bind(pkg.id));
+  stmts.push(c.env.DB.prepare("DELETE FROM dist_tags WHERE package_id = ?").bind(pkg.id));
+  stmts.push(c.env.DB.prepare("DELETE FROM package_access WHERE package_id = ?").bind(pkg.id));
+  stmts.push(c.env.DB.prepare("DELETE FROM search_digest WHERE package_id = ?").bind(pkg.id));
+  stmts.push(c.env.DB.prepare("DELETE FROM download_stats WHERE package_id = ?").bind(pkg.id));
+  stmts.push(c.env.DB.prepare("DELETE FROM agent_installs WHERE package_id = ?").bind(pkg.id));
+  stmts.push(c.env.DB.prepare("DELETE FROM vector_chunks WHERE package_id = ?").bind(pkg.id));
+  stmts.push(c.env.DB.prepare("DELETE FROM transfer_requests WHERE package_id = ?").bind(pkg.id));
+  stmts.push(c.env.DB.prepare("DELETE FROM packages WHERE id = ?").bind(pkg.id));
+  stmts.push(
+    c.env.DB.prepare(
+      "INSERT INTO audit_events (id, action, actor_id, target_type, target_id, metadata) VALUES (?, 'package.delete', ?, 'package', ?, ?)",
+    ).bind(crypto.randomUUID(), user.id, pkg.id, JSON.stringify({ full_name: fullName, versions: versionIds.length })),
+  );
+
+  // D1 batch limit is 100 — chunk if needed
+  for (let i = 0; i < stmts.length; i += 100) {
+    await c.env.DB.batch(stmts.slice(i, i + 100));
+  }
+
+  // Best-effort cleanup: R2 archives + Vectorize index
+  await Promise.allSettled([
+    ...formulaKeys.map(key => c.env.FORMULAS.delete(key)),
+    ...(vectorChunkIds.length > 0 ? [c.env.VECTORIZE.deleteByIds(vectorChunkIds)] : []),
   ]);
 
-  return c.json({ full_name: fullName, deleted: true });
+  return c.json({ full_name: fullName, deleted: true, versions_removed: versionIds.length });
+});
+
+// Delete a single version (hard delete — removes version, metadata, and archive)
+app.delete("/v1/packages/:fullName/versions/:version", authMiddleware, async (c) => {
+  const user = c.get("user");
+  const fullName = decodeURIComponent(c.req.param("fullName")!);
+  const version = c.req.param("version")!;
+
+  const pkg = await c.env.DB.prepare(
+    "SELECT id, publisher_id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+  ).bind(fullName).first<{ id: string; publisher_id: string }>();
+  if (!pkg) throw notFound(`Package ${fullName} not found`);
+
+  const parsed = parseFullName(fullName);
+  if (!parsed) throw badRequest("Invalid package name");
+  const publisher = await getPublisherForScope(c.env.DB, parsed.scope);
+  if (!publisher || !(await canPublish(c.env.DB, user.id, publisher))) {
+    throw forbidden("You don't have permission to delete this version");
+  }
+
+  const ver = await c.env.DB.prepare(
+    "SELECT id, formula_key FROM versions WHERE package_id = ? AND version = ?",
+  ).bind(pkg.id, version).first<{ id: string; formula_key: string }>();
+  if (!ver) throw notFound(`Version ${version} not found for ${fullName}`);
+
+  // Hard delete: metadata → version → dist-tags pointing to this version
+  const stmts: D1PreparedStatement[] = [
+    c.env.DB.prepare("DELETE FROM skill_metadata WHERE version_id = ?").bind(ver.id),
+    c.env.DB.prepare("DELETE FROM mcp_metadata WHERE version_id = ?").bind(ver.id),
+    c.env.DB.prepare("DELETE FROM cli_metadata WHERE version_id = ?").bind(ver.id),
+    c.env.DB.prepare("DELETE FROM install_metadata WHERE version_id = ?").bind(ver.id),
+    c.env.DB.prepare("DELETE FROM trust_checks WHERE version_id = ?").bind(ver.id),
+    c.env.DB.prepare("DELETE FROM dist_tags WHERE version_id = ?").bind(ver.id),
+    c.env.DB.prepare("DELETE FROM versions WHERE id = ?").bind(ver.id),
+    c.env.DB.prepare(
+      "INSERT INTO audit_events (id, action, actor_id, target_type, target_id, metadata) VALUES (?, 'version.delete', ?, 'package', ?, ?)",
+    ).bind(crypto.randomUUID(), user.id, pkg.id, JSON.stringify({ full_name: fullName, version })),
+  ];
+  await c.env.DB.batch(stmts);
+
+  // Delete R2 archive (best-effort)
+  if (ver.formula_key) {
+    await c.env.FORMULAS.delete(ver.formula_key).catch(() => {});
+  }
+
+  // Check if this was the last version — if so, delete the package too
+  const remaining = await c.env.DB.prepare(
+    "SELECT COUNT(*) as count FROM versions WHERE package_id = ?",
+  ).bind(pkg.id).first<{ count: number }>();
+
+  if (!remaining || remaining.count === 0) {
+    // Clean up vectorize
+    const vectorChunks = await c.env.DB.prepare(
+      "SELECT id FROM vector_chunks WHERE package_id = ?",
+    ).bind(pkg.id).all<{ id: string }>();
+    const vectorChunkIds = (vectorChunks.results ?? []).map(r => r.id);
+
+    await c.env.DB.batch([
+      c.env.DB.prepare("DELETE FROM package_access WHERE package_id = ?").bind(pkg.id),
+      c.env.DB.prepare("DELETE FROM search_digest WHERE package_id = ?").bind(pkg.id),
+      c.env.DB.prepare("DELETE FROM download_stats WHERE package_id = ?").bind(pkg.id),
+      c.env.DB.prepare("DELETE FROM agent_installs WHERE package_id = ?").bind(pkg.id),
+      c.env.DB.prepare("DELETE FROM vector_chunks WHERE package_id = ?").bind(pkg.id),
+      c.env.DB.prepare("DELETE FROM transfer_requests WHERE package_id = ?").bind(pkg.id),
+      c.env.DB.prepare("DELETE FROM packages WHERE id = ?").bind(pkg.id),
+    ]);
+
+    if (vectorChunkIds.length > 0) {
+      await c.env.VECTORIZE.deleteByIds(vectorChunkIds).catch(() => {});
+    }
+
+    return c.json({ full_name: fullName, version, deleted: true, package_deleted: true });
+  }
+
+  // Package still has versions — reassign 'latest' dist-tag if it was removed
+  const hasLatest = await c.env.DB.prepare(
+    "SELECT 1 FROM dist_tags WHERE package_id = ? AND tag = 'latest'",
+  ).bind(pkg.id).first();
+
+  if (!hasLatest) {
+    // Find highest non-prerelease version by semver (consistent with autoDistTag in publish)
+    const stableVersions = await c.env.DB.prepare(
+      `SELECT id, version FROM versions WHERE package_id = ? AND version NOT LIKE '%-%'`,
+    ).bind(pkg.id).all<{ id: string; version: string }>();
+
+    let best: { id: string; version: string } | null = null;
+    for (const v of stableVersions.results ?? []) {
+      if (!best) { best = v; continue; }
+      const parsed1 = parseSemVer(v.version);
+      const parsed2 = parseSemVer(best.version);
+      if (parsed1 && parsed2 && compareSemVer(parsed1, parsed2) > 0) {
+        best = v;
+      }
+    }
+
+    if (best) {
+      await c.env.DB.prepare(
+        `INSERT INTO dist_tags (id, package_id, tag, version_id)
+         VALUES (?, ?, 'latest', ?)
+         ON CONFLICT (package_id, tag) DO UPDATE SET version_id = excluded.version_id, updated_at = datetime('now')`,
+      ).bind(crypto.randomUUID(), pkg.id, best.id).run();
+    }
+  }
+
+  // Refresh search_digest: if latest exists, update it; otherwise (only prereleases remain), remove it
+  const latestVer = await c.env.DB.prepare(
+    `SELECT v.version, v.manifest FROM versions v
+     JOIN dist_tags dt ON dt.version_id = v.id
+     WHERE dt.package_id = ? AND dt.tag = 'latest'`,
+  ).bind(pkg.id).first<{ version: string; manifest: string }>();
+
+  if (latestVer) {
+    try {
+      const manifest = JSON.parse(latestVer.manifest);
+      const pkgInfo = await c.env.DB.prepare(
+        "SELECT full_name, type, downloads FROM packages WHERE id = ?",
+      ).bind(pkg.id).first<{ full_name: string; type: string; downloads: number }>();
+      if (pkgInfo) {
+        await upsertSearchDigest(
+          c.env.DB, pkg.id, pkgInfo.full_name, pkgInfo.type,
+          manifest.description ?? "", manifest.summary ?? "",
+          (manifest.keywords ?? []).join(" "), (manifest.capabilities ?? []).join(" "),
+          latestVer.version, pkgInfo.downloads, parsed.scope,
+        );
+      }
+    } catch { /* best-effort search_digest refresh */ }
+  } else {
+    // No latest tag (only prereleases remain) — remove stale search_digest
+    await c.env.DB.prepare("DELETE FROM search_digest WHERE package_id = ?").bind(pkg.id).run();
+  }
+
+  return c.json({ full_name: fullName, version, deleted: true, package_deleted: false });
 });
 
 // ============================================================
