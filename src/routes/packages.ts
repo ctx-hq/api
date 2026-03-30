@@ -7,6 +7,7 @@ import { authMiddleware, optionalAuth } from "../middleware/auth";
 import { canPublish, getPublisherForScope, canAccessPackage } from "../services/publisher";
 import { parseFullName } from "../utils/naming";
 import { upsertSearchDigest } from "../services/publish";
+import { getPackageAccess, grantPackageAccess, revokePackageAccess } from "../services/package-access";
 
 const app = new Hono<AppEnv>();
 
@@ -22,16 +23,33 @@ app.get("/v1/packages", optionalAuth, async (c) => {
   const conditions: string[] = ["deleted_at IS NULL"];
 
   // Visibility: show public to all, plus private/unlisted to authorized publishers
+  // For restricted private packages (with package_access rows), only show to
+  // users in the ACL or org owner/admin — not to all org members.
   const user = c.get("user");
   if (user) {
-    conditions.push(`(visibility = 'public' OR publisher_id IN (
-      SELECT id FROM publishers WHERE user_id = ? AND kind = 'user'
-      UNION
-      SELECT p.id FROM publishers p
-      JOIN org_members m ON p.org_id = m.org_id
-      WHERE m.user_id = ? AND p.kind = 'org'
+    conditions.push(`(visibility = 'public' OR (
+      publisher_id IN (
+        SELECT id FROM publishers WHERE user_id = ? AND kind = 'user'
+        UNION
+        SELECT p.id FROM publishers p
+        JOIN org_members m ON p.org_id = m.org_id
+        WHERE m.user_id = ? AND p.kind = 'org'
+      )
+      AND (
+        visibility != 'private'
+        OR NOT EXISTS (SELECT 1 FROM package_access WHERE package_id = packages.id)
+        OR EXISTS (SELECT 1 FROM package_access WHERE package_id = packages.id AND user_id = ?)
+        OR publisher_id IN (
+          SELECT p.id FROM publishers p
+          JOIN org_members m ON p.org_id = m.org_id
+          WHERE m.user_id = ? AND m.role IN ('owner', 'admin') AND p.kind = 'org'
+        )
+        OR publisher_id IN (
+          SELECT id FROM publishers WHERE user_id = ? AND kind = 'user'
+        )
+      )
     ))`);
-    params.push(user.id, user.id);
+    params.push(user.id, user.id, user.id, user.id, user.id);
   } else {
     conditions.push("visibility = 'public'");
   }
@@ -325,6 +343,121 @@ app.delete("/v1/packages/:fullName", authMiddleware, async (c) => {
   ]);
 
   return c.json({ full_name: fullName, deleted: true });
+});
+
+// ============================================================
+// PACKAGE ACCESS CONTROL (restricted visibility — per-user ACL)
+// ============================================================
+
+// Get package access list
+app.get("/v1/packages/:fullName/access", authMiddleware, async (c) => {
+  const user = c.get("user");
+  const fullName = decodeURIComponent(c.req.param("fullName")!);
+
+  const pkg = await c.env.DB.prepare(
+    "SELECT id, publisher_id, visibility FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+  ).bind(fullName).first();
+
+  if (!pkg) throw notFound(`Package ${fullName} not found`);
+
+  // Must be publisher member (owner/admin for org packages)
+  const parsed = parseFullName(fullName);
+  if (!parsed) throw badRequest("Invalid package name");
+  const publisher = await getPublisherForScope(c.env.DB, parsed.scope);
+  if (!publisher || !(await canPublish(c.env.DB, user.id, publisher))) {
+    throw forbidden("You don't have permission to manage package access");
+  }
+
+  // For org publishers, only owner/admin can manage access
+  if (publisher.kind === "org" && publisher.org_id) {
+    const membership = await c.env.DB.prepare(
+      "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+    ).bind(publisher.org_id, user.id).first<{ role: string }>();
+
+    if (!membership || !["owner", "admin"].includes(membership.role)) {
+      throw forbidden("Only owners and admins can manage package access");
+    }
+  }
+
+  const accessList = await getPackageAccess(c.env.DB, pkg.id as string);
+  return c.json({ access: accessList });
+});
+
+// Update package access list (add/remove users)
+app.patch("/v1/packages/:fullName/access", authMiddleware, async (c) => {
+  const user = c.get("user");
+  const fullName = decodeURIComponent(c.req.param("fullName")!);
+
+  let body: { add?: string[]; remove?: string[] };
+  try {
+    body = await c.req.json();
+  } catch {
+    throw badRequest("Invalid JSON body");
+  }
+
+  if (!body.add?.length && !body.remove?.length) {
+    throw badRequest("Must provide add or remove arrays");
+  }
+
+  const pkg = await c.env.DB.prepare(
+    "SELECT id, publisher_id, visibility FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+  ).bind(fullName).first();
+
+  if (!pkg) throw notFound(`Package ${fullName} not found`);
+
+  if (pkg.visibility !== "private") {
+    throw badRequest("Package access control only applies to private packages");
+  }
+
+  // Must be org owner/admin
+  const parsed = parseFullName(fullName);
+  if (!parsed) throw badRequest("Invalid package name");
+  const publisher = await getPublisherForScope(c.env.DB, parsed.scope);
+
+  if (!publisher || publisher.kind !== "org" || !publisher.org_id) {
+    throw badRequest("Package access control only applies to organization packages");
+  }
+
+  const membership = await c.env.DB.prepare(
+    "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+  ).bind(publisher.org_id, user.id).first<{ role: string }>();
+
+  if (!membership || !["owner", "admin"].includes(membership.role)) {
+    throw forbidden("Only owners and admins can manage package access");
+  }
+
+  // Resolve usernames to user IDs and validate they are org members
+  const added: string[] = [];
+  if (body.add?.length) {
+    for (const username of body.add) {
+      const targetUser = await c.env.DB.prepare(
+        "SELECT id FROM users WHERE username = ?",
+      ).bind(username).first<{ id: string }>();
+      if (!targetUser) throw notFound(`User ${username} not found`);
+
+      const isMember = await c.env.DB.prepare(
+        "SELECT 1 FROM org_members WHERE org_id = ? AND user_id = ?",
+      ).bind(publisher.org_id, targetUser.id).first();
+      if (!isMember) throw badRequest(`${username} is not a member of the organization`);
+
+      added.push(targetUser.id);
+    }
+    await grantPackageAccess(c.env.DB, pkg.id as string, added, user.id);
+  }
+
+  const removed: string[] = [];
+  if (body.remove?.length) {
+    for (const username of body.remove) {
+      const targetUser = await c.env.DB.prepare(
+        "SELECT id FROM users WHERE username = ?",
+      ).bind(username).first<{ id: string }>();
+      if (!targetUser) continue; // silently skip unknown users on remove
+      removed.push(targetUser.id);
+    }
+    await revokePackageAccess(c.env.DB, pkg.id as string, removed);
+  }
+
+  return c.json({ added: body.add ?? [], removed: body.remove ?? [] });
 });
 
 export default app;

@@ -1,10 +1,22 @@
 import { Hono } from "hono";
 import type { AppEnv } from "../bindings";
 import { authMiddleware, optionalAuth } from "../middleware/auth";
-import { badRequest, notFound, forbidden } from "../utils/errors";
+import { badRequest, notFound, forbidden, conflict } from "../utils/errors";
 import { isValidScope } from "../utils/naming";
 import { generateId } from "../utils/response";
 import { createOrgPublisher, getPublisherForScope, canPublish } from "../services/publisher";
+import type { InvitationStatus } from "../models/types";
+import {
+  createInvitation,
+  listOrgInvitations,
+  listUserInvitations,
+  acceptInvitation,
+  declineInvitation,
+  cancelInvitation,
+  cancelUserInvitations,
+  expirePendingInvitations,
+} from "../services/invitation";
+import { cleanupUserAccessForOrg } from "../services/package-access";
 
 const app = new Hono<AppEnv>();
 
@@ -66,15 +78,39 @@ app.get("/v1/orgs/:name", optionalAuth, async (c) => {
     "SELECT COUNT(*) as count FROM org_members WHERE org_id = ?"
   ).bind(org.id).first();
 
-  // Package count: members see all, others see only public (consistent with /packages)
+  // Package count: respect package_access restrictions for non-owner/admin members
   const user = c.get("user");
   const publisher = await getPublisherForScope(c.env.DB, name!);
   const isMember = user && publisher ? await canPublish(c.env.DB, user.id, publisher) : false;
-  const visibilityClause = isMember ? "" : "AND visibility = 'public'";
 
-  const packageCount = await c.env.DB.prepare(
-    `SELECT COUNT(*) as count FROM packages WHERE scope = ? ${visibilityClause} AND deleted_at IS NULL`,
-  ).bind(name).first();
+  let packageCount: Record<string, unknown> | null;
+  if (!isMember) {
+    packageCount = await c.env.DB.prepare(
+      "SELECT COUNT(*) as count FROM packages WHERE scope = ? AND visibility = 'public' AND deleted_at IS NULL",
+    ).bind(name).first();
+  } else {
+    // Check if user is owner/admin (bypasses package_access restrictions)
+    const membership = await c.env.DB.prepare(
+      "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+    ).bind(org.id, user.id).first<{ role: string }>();
+
+    if (membership && ["owner", "admin"].includes(membership.role)) {
+      // Owner/admin sees all
+      packageCount = await c.env.DB.prepare(
+        "SELECT COUNT(*) as count FROM packages WHERE scope = ? AND deleted_at IS NULL",
+      ).bind(name).first();
+    } else {
+      // Regular member: exclude restricted private packages they aren't granted access to
+      packageCount = await c.env.DB.prepare(
+        `SELECT COUNT(*) as count FROM packages WHERE scope = ? AND deleted_at IS NULL
+         AND (
+           visibility != 'private'
+           OR NOT EXISTS (SELECT 1 FROM package_access WHERE package_id = packages.id)
+           OR EXISTS (SELECT 1 FROM package_access WHERE package_id = packages.id AND user_id = ?)
+         )`,
+      ).bind(name, user.id).first();
+    }
+  }
 
   return c.json({
     id: org.id,
@@ -102,7 +138,7 @@ app.get("/v1/orgs/:name/members", authMiddleware, async (c) => {
   }
 
   const members = await c.env.DB.prepare(
-    `SELECT u.username, u.avatar_url, m.role, m.created_at
+    `SELECT u.username, u.avatar_url, m.role, m.visibility, m.created_at
      FROM org_members m JOIN users u ON m.user_id = u.id
      WHERE m.org_id = ?`
   ).bind(org.id).all();
@@ -194,6 +230,12 @@ app.delete("/v1/orgs/:name/members/:username", authMiddleware, async (c) => {
     }
   }
 
+  // Cascade cleanup: package access + pending invitations + membership
+  await Promise.all([
+    cleanupUserAccessForOrg(c.env.DB, targetUser.id as string, org.id as string),
+    cancelUserInvitations(c.env.DB, org.id as string, targetUser.id as string),
+  ]);
+
   await c.env.DB.prepare(
     "DELETE FROM org_members WHERE org_id = ? AND user_id = ?"
   ).bind(org.id, targetUser.id).run();
@@ -220,6 +262,8 @@ app.get("/v1/orgs/:name/packages", optionalAuth, async (c) => {
   if (!org) throw notFound(`Organization @${name} not found`);
 
   // Members see all visibility levels; others see only public
+  // Restricted private packages (with package_access rows) are hidden from
+  // regular members unless they have an explicit grant.
   const user = c.get("user");
   const publisher = await getPublisherForScope(c.env.DB, name!);
   const isMember = user && publisher ? await canPublish(c.env.DB, user.id, publisher) : false;
@@ -228,6 +272,21 @@ app.get("/v1/orgs/:name/packages", optionalAuth, async (c) => {
   const params: unknown[] = [name];
   if (!isMember) {
     conditions.push("visibility = 'public'");
+  } else {
+    // Check if owner/admin (can see everything)
+    const membership = await c.env.DB.prepare(
+      "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+    ).bind(org.id, user.id).first<{ role: string }>();
+
+    if (!membership || !["owner", "admin"].includes(membership.role)) {
+      // Regular member: exclude restricted private packages without grant
+      conditions.push(`(
+        visibility != 'private'
+        OR NOT EXISTS (SELECT 1 FROM package_access WHERE package_id = packages.id)
+        OR EXISTS (SELECT 1 FROM package_access WHERE package_id = packages.id AND user_id = ?)
+      )`);
+      params.push(user.id);
+    }
   }
 
   const packages = await c.env.DB.prepare(
@@ -292,6 +351,14 @@ app.delete("/v1/orgs/:name", authMiddleware, async (c) => {
   }
 
   await c.env.DB.batch([
+    c.env.DB.prepare("DELETE FROM org_invitations WHERE org_id = ?").bind(org.id),
+    c.env.DB.prepare(
+      `DELETE FROM package_access WHERE package_id IN (
+         SELECT id FROM packages WHERE publisher_id IN (
+           SELECT id FROM publishers WHERE org_id = ?
+         )
+       )`,
+    ).bind(org.id),
     c.env.DB.prepare("DELETE FROM org_members WHERE org_id = ?").bind(org.id),
     c.env.DB.prepare("DELETE FROM scopes WHERE name = ?").bind(name),
     c.env.DB.prepare("DELETE FROM publishers WHERE org_id = ?").bind(org.id),
@@ -355,6 +422,236 @@ app.patch("/v1/orgs/:name/members/:username", authMiddleware, async (c) => {
   ).bind(body.role, org.id, targetUser.id).run();
 
   return c.json({ username, role: body.role });
+});
+
+// ============================================================
+// INVITATION ROUTES
+// ============================================================
+
+// Create invitation (owner/admin only)
+app.post("/v1/orgs/:name/invitations", authMiddleware, async (c) => {
+  const user = c.get("user");
+  const name = c.req.param("name");
+
+  let body: { username: string; role?: string };
+  try {
+    body = await c.req.json();
+  } catch {
+    throw badRequest("Invalid JSON body");
+  }
+
+  if (!body.username) throw badRequest("username is required");
+
+  const org = await c.env.DB.prepare("SELECT id FROM orgs WHERE name = ?").bind(name).first();
+  if (!org) throw notFound(`Organization @${name} not found`);
+
+  // Verify caller is owner or admin
+  const callerMembership = await c.env.DB.prepare(
+    "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+  ).bind(org.id, user.id).first();
+
+  if (!callerMembership || !["owner", "admin"].includes(callerMembership.role as string)) {
+    throw forbidden("Only owners and admins can invite members");
+  }
+
+  const role = body.role ?? "member";
+  if (!["owner", "admin", "member"].includes(role)) {
+    throw badRequest("Role must be owner, admin, or member");
+  }
+  if (role === "owner" && callerMembership.role !== "owner") {
+    throw forbidden("Only owners can invite with the owner role");
+  }
+
+  // Find target user
+  const targetUser = await c.env.DB.prepare(
+    "SELECT id FROM users WHERE username = ?",
+  ).bind(body.username).first();
+  if (!targetUser) throw notFound(`User ${body.username} not found`);
+
+  // Cannot invite yourself
+  if (targetUser.id === user.id) throw badRequest("Cannot invite yourself");
+
+  // Check if already a member
+  const existingMembership = await c.env.DB.prepare(
+    "SELECT 1 FROM org_members WHERE org_id = ? AND user_id = ?",
+  ).bind(org.id, targetUser.id).first();
+  if (existingMembership) throw conflict(`${body.username} is already a member of @${name}`);
+
+  // Expire stale invitations before checking, so expired ones don't block re-invite
+  await expirePendingInvitations(c.env.DB);
+
+  // Check for existing pending invitation
+  const existingInvitation = await c.env.DB.prepare(
+    "SELECT 1 FROM org_invitations WHERE org_id = ? AND invitee_id = ? AND status = 'pending'",
+  ).bind(org.id, targetUser.id).first();
+  if (existingInvitation) throw conflict(`${body.username} already has a pending invitation to @${name}`);
+
+  const invitation = await createInvitation(
+    c.env.DB,
+    org.id as string,
+    user.id,
+    targetUser.id as string,
+    role,
+  );
+
+  return c.json({
+    id: invitation.id,
+    org_name: name,
+    inviter: user.username,
+    invitee: body.username,
+    role: invitation.role,
+    status: invitation.status,
+    expires_at: invitation.expires_at,
+    created_at: invitation.created_at,
+  }, 201);
+});
+
+// List org invitations (owner/admin only)
+app.get("/v1/orgs/:name/invitations", authMiddleware, async (c) => {
+  const user = c.get("user");
+  const name = c.req.param("name");
+  const statusFilter = c.req.query("status") as string | undefined;
+
+  const org = await c.env.DB.prepare("SELECT id FROM orgs WHERE name = ?").bind(name).first();
+  if (!org) throw notFound(`Organization @${name} not found`);
+
+  const callerMembership = await c.env.DB.prepare(
+    "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+  ).bind(org.id, user.id).first();
+
+  if (!callerMembership || !["owner", "admin"].includes(callerMembership.role as string)) {
+    throw forbidden("Only owners and admins can view invitations");
+  }
+
+  const validStatuses = ["pending", "accepted", "declined", "expired", "cancelled"];
+  const status = statusFilter && validStatuses.includes(statusFilter) ? statusFilter : undefined;
+
+  const invitations = await listOrgInvitations(
+    c.env.DB,
+    org.id as string,
+    status as InvitationStatus | undefined,
+  );
+
+  return c.json({ invitations });
+});
+
+// Cancel invitation (owner/admin only)
+app.delete("/v1/orgs/:name/invitations/:id", authMiddleware, async (c) => {
+  const user = c.get("user");
+  const name = c.req.param("name");
+  const invitationId = c.req.param("id");
+
+  const org = await c.env.DB.prepare("SELECT id FROM orgs WHERE name = ?").bind(name).first();
+  if (!org) throw notFound(`Organization @${name} not found`);
+
+  const callerMembership = await c.env.DB.prepare(
+    "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+  ).bind(org.id, user.id).first();
+
+  if (!callerMembership || !["owner", "admin"].includes(callerMembership.role as string)) {
+    throw forbidden("Only owners and admins can cancel invitations");
+  }
+
+  const cancelled = await cancelInvitation(c.env.DB, invitationId!, org.id as string);
+  if (!cancelled) throw notFound("Invitation not found or not pending");
+
+  return c.json({ cancelled: invitationId });
+});
+
+// ============================================================
+// USER INVITATION ROUTES (/v1/me/invitations)
+// ============================================================
+
+// List my pending invitations
+app.get("/v1/me/invitations", authMiddleware, async (c) => {
+  const user = c.get("user");
+  const invitations = await listUserInvitations(c.env.DB, user.id);
+  return c.json({ invitations });
+});
+
+// Accept invitation
+app.post("/v1/me/invitations/:id/accept", authMiddleware, async (c) => {
+  const user = c.get("user");
+  const invitationId = c.req.param("id")!;
+
+  const result = await acceptInvitation(c.env.DB, invitationId, user.id);
+  if (!result) throw notFound("Invitation not found, not pending, or expired");
+
+  const org = await c.env.DB.prepare("SELECT name FROM orgs WHERE id = ?")
+    .bind(result.org_id)
+    .first<{ name: string }>();
+
+  return c.json({
+    accepted: invitationId,
+    org_name: org?.name ?? "unknown",
+    role: result.role,
+  });
+});
+
+// Decline invitation
+app.post("/v1/me/invitations/:id/decline", authMiddleware, async (c) => {
+  const user = c.get("user");
+  const invitationId = c.req.param("id")!;
+
+  const declined = await declineInvitation(c.env.DB, invitationId, user.id);
+  if (!declined) throw notFound("Invitation not found or not pending");
+
+  return c.json({ declined: invitationId });
+});
+
+// ============================================================
+// MEMBER VISIBILITY ROUTES
+// ============================================================
+
+// Toggle own membership visibility
+app.patch("/v1/orgs/:name/members/:username/visibility", authMiddleware, async (c) => {
+  const user = c.get("user");
+  const name = c.req.param("name");
+  const username = c.req.param("username");
+
+  // Only allow users to change their own visibility
+  if (user.username !== username) {
+    throw forbidden("You can only change your own membership visibility");
+  }
+
+  let body: { visibility: string };
+  try {
+    body = await c.req.json();
+  } catch {
+    throw badRequest("Invalid JSON body");
+  }
+
+  if (!["public", "private"].includes(body.visibility)) {
+    throw badRequest("Visibility must be public or private");
+  }
+
+  const org = await c.env.DB.prepare("SELECT id FROM orgs WHERE name = ?").bind(name).first();
+  if (!org) throw notFound(`Organization @${name} not found`);
+
+  const result = await c.env.DB.prepare(
+    "UPDATE org_members SET visibility = ? WHERE org_id = ? AND user_id = ?",
+  ).bind(body.visibility, org.id, user.id).run();
+
+  if ((result.meta?.changes ?? 0) === 0) {
+    throw notFound("You are not a member of this organization");
+  }
+
+  return c.json({ username, visibility: body.visibility });
+});
+
+// List public members (no auth required)
+app.get("/v1/orgs/:name/public-members", async (c) => {
+  const name = c.req.param("name");
+  const org = await c.env.DB.prepare("SELECT id FROM orgs WHERE name = ?").bind(name).first();
+  if (!org) throw notFound(`Organization @${name} not found`);
+
+  const members = await c.env.DB.prepare(
+    `SELECT u.username, u.avatar_url, m.role, m.created_at
+     FROM org_members m JOIN users u ON m.user_id = u.id
+     WHERE m.org_id = ? AND m.visibility = 'public'`,
+  ).bind(org.id).all();
+
+  return c.json({ members: members.results ?? [] });
 });
 
 export default app;

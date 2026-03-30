@@ -1,5 +1,6 @@
 import type { PublisherRow } from "../models/types";
 import { generateId } from "../utils/response";
+import { hasAccessRestrictions, userHasAccess } from "./package-access";
 
 /**
  * Get or create a personal publisher for a user.
@@ -49,13 +50,20 @@ export async function createOrgPublisher(
 }
 
 /**
- * Check if a user can access a private package (is a publisher member).
+ * Check if a user can access a private package.
  * Returns true for public/unlisted packages.
+ *
+ * For org packages with package_access rows (restricted mode):
+ * - Owner/admin always have access
+ * - Other members need an explicit grant in package_access
+ *
+ * For org packages without package_access rows (standard private):
+ * - All org members have access
  */
 export async function canAccessPackage(
   db: D1Database,
   userId: string | null,
-  pkg: { visibility?: unknown; publisher_id?: unknown },
+  pkg: { id?: unknown; visibility?: unknown; publisher_id?: unknown },
 ): Promise<boolean> {
   if (pkg.visibility !== "private") return true;
   if (!userId) return false;
@@ -69,7 +77,36 @@ export async function canAccessPackage(
     .first<PublisherRow>();
 
   if (!publisher) return false;
-  return canPublish(db, userId, publisher);
+
+  // User publisher: simple ownership check
+  if (publisher.kind === "user") {
+    return publisher.user_id === userId;
+  }
+
+  // Org publisher: check membership first
+  if (publisher.kind === "org" && publisher.org_id) {
+    const membership = await db
+      .prepare("SELECT role FROM org_members WHERE org_id = ? AND user_id = ?")
+      .bind(publisher.org_id, userId)
+      .first<{ role: string }>();
+
+    if (!membership) return false;
+
+    // Owner/admin always have access to all org packages
+    if (membership.role === "owner" || membership.role === "admin") return true;
+
+    // Check if package has access restrictions
+    const packageId = pkg.id as string;
+    if (packageId && await hasAccessRestrictions(db, packageId)) {
+      // Restricted mode: member needs explicit grant
+      return userHasAccess(db, packageId, userId);
+    }
+
+    // Standard private: all members have access
+    return true;
+  }
+
+  return false;
 }
 
 /**

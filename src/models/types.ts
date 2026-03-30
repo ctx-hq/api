@@ -174,6 +174,31 @@ export interface SyncProfileMeta {
   last_pull_device: string;
 }
 
+// --- Organization invitation types ---
+
+export type InvitationStatus = "pending" | "accepted" | "declined" | "expired" | "cancelled";
+
+export interface OrgInvitationRow {
+  id: string;
+  org_id: string;
+  inviter_id: string;
+  invitee_id: string;
+  role: string;
+  status: InvitationStatus;
+  expires_at: string;
+  created_at: string;
+  resolved_at: string | null;
+}
+
+export type MemberVisibility = "public" | "private";
+
+export interface PackageAccessRow {
+  package_id: string;
+  user_id: string;
+  granted_by: string;
+  created_at: string;
+}
+
 export interface ScannerCandidateRow {
   id: string;
   source_id: string;
