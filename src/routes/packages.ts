@@ -154,23 +154,26 @@ app.get("/v1/packages/:fullName", optionalAuth, async (c) => {
   // Fetch MCP-specific metadata for MCP packages
   let mcpDetail = null;
   if (pkg.type === "mcp") {
-    const mm = await c.env.DB.prepare(
-      `SELECT mm.transport, mm.command, mm.args, mm.url, mm.env_vars, mm.tools, mm.resources, mm.category
-       FROM mcp_metadata mm
-       JOIN dist_tags dt ON dt.version_id = mm.version_id
-       WHERE dt.package_id = ? AND dt.tag = 'latest'`
-    ).bind(pkg.id).first();
-    if (mm) {
-      mcpDetail = {
-        transport: mm.transport ?? "stdio",
-        command: mm.command ?? "",
-        args: parseJsonArray(mm.args as string),
-        url: mm.url ?? "",
-        env_vars: parseJsonArray(mm.env_vars as string),
-        tools: parseJsonArray(mm.tools as string),
-        resources: parseJsonArray(mm.resources as string),
-        category: mm.category ?? "",
-      };
+    try {
+      const mm = await c.env.DB.prepare(
+        `SELECT mm.transport, mm.command, mm.args, mm.url, mm.env_vars, mm.tools, mm.resources
+         FROM mcp_metadata mm
+         JOIN dist_tags dt ON dt.version_id = mm.version_id
+         WHERE dt.package_id = ? AND dt.tag = 'latest'`
+      ).bind(pkg.id).first();
+      if (mm) {
+        mcpDetail = {
+          transport: mm.transport ?? "stdio",
+          command: mm.command ?? "",
+          args: parseJsonArray(mm.args as string),
+          url: mm.url ?? "",
+          env_vars: parseJsonArray(mm.env_vars as string),
+          tools: parseJsonArray(mm.tools as string),
+          resources: parseJsonArray(mm.resources as string),
+        };
+      }
+    } catch {
+      // mcp_metadata may not have all columns yet (pre-migration)
     }
   }
 

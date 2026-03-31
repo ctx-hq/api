@@ -7,7 +7,7 @@ export async function getPackageByName(db: D1Database, fullName: string) {
 
 export async function getLatestVersion(db: D1Database, packageId: string) {
   const result = await db.prepare(
-    "SELECT version FROM versions WHERE package_id = ? AND yanked = 0"
+    "SELECT version, manifest FROM versions WHERE package_id = ? AND yanked = 0"
   ).bind(packageId).all();
 
   const rows = result.results ?? [];
