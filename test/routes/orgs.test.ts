@@ -53,7 +53,7 @@ function createMockDB(overrides?: {
 // --- Test fixtures ---
 
 const org = { id: "org-acme", name: "acme", display_name: "Acme Corp", created_at: "2026-01-01" };
-const orgPublisher = { id: "pub-org-acme", kind: "org", user_id: null, org_id: "org-acme", slug: "acme", created_at: "2026-01-01" };
+const orgScope = { name: "acme", owner_type: "org", owner_id: "org-acme" };
 
 const allPackages = [
   { full_name: "@acme/public-tool", type: "cli", description: "pub", summary: "", visibility: "public", downloads: 100, created_at: "2026-01-01", deleted_at: null },
@@ -71,8 +71,7 @@ function createOrgApp(user?: { id: string }) {
       if (sql.includes("org_members WHERE org_id") && sql.includes("user_id")) {
         return isMember ? { role: "member" } : null;
       }
-      if (sql.includes("FROM scopes WHERE name")) return { publisher_id: orgPublisher.id };
-      if (sql.includes("FROM publishers WHERE id")) return orgPublisher;
+      if (sql.includes("FROM scopes WHERE name")) return orgScope;
       if (sql.includes("COUNT(*) as count FROM org_members")) return { count: 3 };
       if (sql.includes("COUNT(*) as count FROM packages")) {
         const visible = allPackages.filter(p => {
@@ -113,14 +112,13 @@ function createOrgApp(user?: { id: string }) {
 
     // Auth-aware package count
     const user = c.get("user");
-    const scope = await c.env.DB.prepare("SELECT publisher_id FROM scopes WHERE name = ?").bind(name).first();
-    const pub = scope ? await c.env.DB.prepare("SELECT * FROM publishers WHERE id = ?").bind((scope as any).publisher_id).first() : null;
+    const scopeOwner = await c.env.DB.prepare("SELECT owner_type, owner_id FROM scopes WHERE name = ?").bind(name).first<{ owner_type: string; owner_id: string }>();
 
     let member = false;
-    if (user && pub && (pub as any).kind === "org" && (pub as any).org_id) {
+    if (user && scopeOwner && scopeOwner.owner_type === "org") {
       const membership = await c.env.DB.prepare(
         "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
-      ).bind((pub as any).org_id, user.id).first();
+      ).bind(scopeOwner.owner_id, user.id).first();
       member = membership !== null;
     }
 
@@ -145,14 +143,13 @@ function createOrgApp(user?: { id: string }) {
     if (!o) return c.json({ error: "not found" }, 404);
 
     const user = c.get("user");
-    const scope = await c.env.DB.prepare("SELECT publisher_id FROM scopes WHERE name = ?").bind(name).first();
-    const pub = scope ? await c.env.DB.prepare("SELECT * FROM publishers WHERE id = ?").bind((scope as any).publisher_id).first() : null;
+    const scopeOwner = await c.env.DB.prepare("SELECT owner_type, owner_id FROM scopes WHERE name = ?").bind(name).first<{ owner_type: string; owner_id: string }>();
 
     let member = false;
-    if (user && pub && (pub as any).kind === "org" && (pub as any).org_id) {
+    if (user && scopeOwner && scopeOwner.owner_type === "org") {
       const membership = await c.env.DB.prepare(
         "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
-      ).bind((pub as any).org_id, user.id).first();
+      ).bind(scopeOwner.owner_id, user.id).first();
       member = membership !== null;
     }
 

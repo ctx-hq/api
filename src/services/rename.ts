@@ -122,7 +122,7 @@ export async function renamePackage(
 }
 
 /**
- * Rename an organization. Cascades to: publisher slug, scope, all packages.
+ * Rename an organization. Cascades to: scope, all packages.
  * Creates scope_alias + slug_aliases for all affected packages.
  */
 export async function renameOrg(
@@ -157,11 +157,6 @@ export async function renameOrg(
       "UPDATE orgs SET name = ?, renamed_at = datetime('now') WHERE id = ?",
     ).bind(newName, orgId),
 
-    // Update publisher slug
-    db.prepare(
-      "UPDATE publishers SET slug = ? WHERE org_id = ?",
-    ).bind(newName, orgId),
-
     // Update scope name
     db.prepare(
       "UPDATE scopes SET name = ? WHERE name = ?",
@@ -192,7 +187,7 @@ export async function renameOrg(
 
     stmts.push(
       db.prepare(
-        "UPDATE search_digest SET full_name = ?, publisher_slug = ?, updated_at = datetime('now') WHERE package_id = ?",
+        "UPDATE search_digest SET full_name = ?, owner_slug = ?, updated_at = datetime('now') WHERE package_id = ?",
       ).bind(newFullName, newName, pkg.id),
     );
   }
@@ -216,7 +211,7 @@ export async function renameOrg(
 }
 
 /**
- * Rename a user. Cascades to: publisher slug, scope, all personal packages.
+ * Rename a user. Cascades to: scope, all personal packages.
  */
 export async function renameUser(
   db: D1Database,
@@ -249,11 +244,6 @@ export async function renameUser(
       "UPDATE users SET username = ?, renamed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?",
     ).bind(newUsername, userId),
 
-    // Update publisher slug
-    db.prepare(
-      "UPDATE publishers SET slug = ? WHERE user_id = ? AND kind = 'user'",
-    ).bind(newUsername, userId),
-
     // Update scope
     db.prepare(
       "UPDATE scopes SET name = ? WHERE owner_type = 'user' AND owner_id = ?",
@@ -282,7 +272,7 @@ export async function renameUser(
 
     stmts.push(
       db.prepare(
-        "UPDATE search_digest SET full_name = ?, publisher_slug = ?, updated_at = datetime('now') WHERE package_id = ?",
+        "UPDATE search_digest SET full_name = ?, owner_slug = ?, updated_at = datetime('now') WHERE package_id = ?",
       ).bind(newFullName, newUsername, pkg.id),
     );
   }

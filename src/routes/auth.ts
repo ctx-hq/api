@@ -4,7 +4,8 @@ import { generateId } from "../utils/response";
 import { hashToken } from "../services/auth";
 import { authMiddleware } from "../middleware/auth";
 import { badRequest, forbidden, notFound } from "../utils/errors";
-import { getOrCreatePublisher } from "../services/publisher";
+import { SYSTEM_OWNER_ID, SYSTEM_DELETED_ID } from "../models/types";
+import { ensureUserScope } from "../services/ownership";
 import { renameUser, checkRenameCooldown, isNameAvailable } from "../services/rename";
 
 const app = new Hono<AppEnv>();
@@ -130,8 +131,8 @@ app.post("/v1/auth/token", async (c) => {
       user = { id: userId };
     }
 
-    // Auto-create personal publisher
-    await getOrCreatePublisher(c.env.DB, user.id as string, data.username);
+    // Auto-create personal scope
+    const scopeOk = await ensureUserScope(c.env.DB, user.id as string, data.username);
 
     // Create API token
     await c.env.DB.prepare(
@@ -141,11 +142,15 @@ app.post("/v1/auth/token", async (c) => {
     // Clean up device code
     await c.env.CACHE.delete(`device:${deviceCode}`);
 
-    return c.json({
+    const response: Record<string, unknown> = {
       access_token: token,
       token_type: "bearer",
       scope: "read write",
-    });
+    };
+    if (!scopeOk) {
+      response.warning = `Scope @${data.username} is owned by another entity. You may not be able to publish to @${data.username}.`;
+    }
+    return c.json(response);
   }
 
   return c.json({ error: "authorization_pending" }, 400);
@@ -228,6 +233,7 @@ app.post("/v1/auth/github", async (c) => {
   let user = await c.env.DB.prepare(
     "SELECT id FROM users WHERE github_id = ?"
   ).bind(githubId).first();
+  let scopeOk = true;
 
   if (user) {
     // Update profile (email may change, avatar may change)
@@ -235,8 +241,8 @@ app.post("/v1/auth/github", async (c) => {
       "UPDATE users SET username = ?, email = ?, avatar_url = ?, updated_at = datetime('now') WHERE id = ?"
     ).bind(username, email, avatarUrl, user.id).run();
 
-    // Ensure publisher exists for returning users
-    await getOrCreatePublisher(c.env.DB, user.id as string, username);
+    // Ensure scope exists for returning users
+    scopeOk = await ensureUserScope(c.env.DB, user.id as string, username);
   } else {
     const userId = generateId();
     await c.env.DB.prepare(
@@ -244,11 +250,8 @@ app.post("/v1/auth/github", async (c) => {
     ).bind(userId, username, email, avatarUrl, githubId).run();
     user = { id: userId };
 
-    // Auto-create personal publisher + user scope
-    const publisher = await getOrCreatePublisher(c.env.DB, userId, username);
-    await c.env.DB.prepare(
-      "INSERT OR IGNORE INTO scopes (name, owner_type, owner_id, publisher_id) VALUES (?, 'user', ?, ?)"
-    ).bind(username.toLowerCase(), userId, publisher.id).run();
+    // Auto-create personal user scope
+    scopeOk = await ensureUserScope(c.env.DB, userId, username);
   }
 
   // Generate session token
@@ -259,7 +262,11 @@ app.post("/v1/auth/github", async (c) => {
     "INSERT INTO api_tokens (id, user_id, token_hash, name) VALUES (?, ?, ?, 'web')"
   ).bind(generateId(), user.id, tokenHash).run();
 
-  return c.json({ token });
+  const response: Record<string, unknown> = { token };
+  if (!scopeOk) {
+    response.warning = `Scope @${username} is owned by another entity. You may not be able to publish to @${username}.`;
+  }
+  return c.json(response);
 });
 
 // Get current user (validate session)
@@ -394,7 +401,7 @@ app.delete("/v1/me", authMiddleware, async (c) => {
   const user = c.get("user");
 
   // Prevent deleting system accounts
-  if (user.id === "system-scanner" || user.id === "system-deleted") {
+  if (user.id === SYSTEM_OWNER_ID || user.id === SYSTEM_DELETED_ID) {
     throw forbidden("System accounts cannot be deleted");
   }
 
@@ -424,11 +431,11 @@ app.delete("/v1/me", authMiddleware, async (c) => {
     ).bind(anonymizedUsername, `deleted:${user.id}`, user.id),
     // Reassign package ownership
     c.env.DB.prepare(
-      "UPDATE packages SET owner_id = 'system-deleted' WHERE owner_id = ?"
+      `UPDATE packages SET owner_id = '${SYSTEM_DELETED_ID}' WHERE owner_id = ?`
     ).bind(user.id),
-    // Reassign version publisher references
+    // Reassign version published_by references
     c.env.DB.prepare(
-      "UPDATE versions SET published_by = 'system-deleted' WHERE published_by = ?"
+      `UPDATE versions SET published_by = '${SYSTEM_DELETED_ID}' WHERE published_by = ?`
     ).bind(user.id),
     // Revoke all tokens
     c.env.DB.prepare(

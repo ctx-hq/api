@@ -3,13 +3,13 @@ import type { AppEnv } from "../bindings";
 import { notFound } from "../utils/errors";
 import { generateId } from "../utils/response";
 import { optionalAuth } from "../middleware/auth";
-import { canAccessPackage } from "../services/publisher";
+import { canAccessPackage } from "../services/ownership";
 
 const app = new Hono<AppEnv>();
 
 // Registry overview (aggregate stats)
 app.get("/v1/stats/overview", async (c) => {
-  const [packagesResult, downloadsResult, publishersResult, breakdownResult] =
+  const [packagesResult, downloadsResult, ownersResult, breakdownResult] =
     await Promise.all([
       c.env.DB.prepare(
         "SELECT COUNT(*) as count FROM packages WHERE visibility = 'public' AND deleted_at IS NULL",
@@ -24,7 +24,7 @@ app.get("/v1/stats/overview", async (c) => {
         .first<{ total: number }>(),
 
       c.env.DB.prepare(
-        "SELECT COUNT(DISTINCT publisher_id) as count FROM packages WHERE visibility = 'public' AND deleted_at IS NULL AND publisher_id != ''",
+        "SELECT COUNT(DISTINCT owner_id) as count FROM packages WHERE visibility = 'public' AND deleted_at IS NULL AND owner_type != 'system'",
       )
         .first<{ count: number }>(),
 
@@ -48,7 +48,7 @@ app.get("/v1/stats/overview", async (c) => {
   return c.json({
     total_packages: totalPackages,
     total_downloads: downloadsResult?.total ?? 0,
-    total_publishers: publishersResult?.count ?? 0,
+    total_owners: ownersResult?.count ?? 0,
     breakdown,
   });
 });
@@ -58,7 +58,7 @@ app.get("/v1/packages/:fullName/stats", optionalAuth, async (c) => {
   const fullName = decodeURIComponent(c.req.param("fullName")!);
 
   const pkg = await c.env.DB.prepare(
-    "SELECT id, downloads, visibility, publisher_id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+    "SELECT id, downloads, visibility, owner_type, owner_id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
   )
     .bind(fullName)
     .first();

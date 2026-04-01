@@ -3,7 +3,7 @@ import type { AppEnv } from "../bindings";
 import { badRequest } from "../utils/errors";
 import { resolveDistTag } from "../services/version";
 import { optionalAuth } from "../middleware/auth";
-import { canAccessPackage } from "../services/publisher";
+import { canAccessPackage } from "../services/ownership";
 
 const app = new Hono<AppEnv>();
 
@@ -25,7 +25,7 @@ app.post("/v1/resolve", optionalAuth, async (c) => {
 
   for (const [fullName, constraint] of Object.entries(body.packages)) {
     const pkg = await c.env.DB.prepare(
-      "SELECT id, visibility, publisher_id FROM packages WHERE full_name = ? AND deleted_at IS NULL"
+      "SELECT id, visibility, owner_type, owner_id FROM packages WHERE full_name = ? AND deleted_at IS NULL"
     ).bind(fullName).first();
 
     if (!pkg || !(await canAccessPackage(c.env.DB, user?.id ?? null, pkg))) {

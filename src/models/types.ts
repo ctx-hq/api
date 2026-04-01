@@ -4,6 +4,12 @@ export type PackageType = "skill" | "mcp" | "cli" | "collection";
 
 export type EnrichmentStatus = "pending" | "queued" | "enriched" | "failed";
 
+export type OwnerType = "user" | "org" | "system";
+
+// Well-known system identifiers
+export const SYSTEM_OWNER_ID = "system-scanner";
+export const SYSTEM_DELETED_ID = "system-deleted";
+
 export interface PackageRow {
   id: string;
   scope: string;
@@ -20,8 +26,8 @@ export interface PackageRow {
   license: string;
   keywords: string; // JSON array
   platforms: string; // JSON array
+  owner_type: OwnerType;
   owner_id: string;
-  publisher_id: string;
   visibility: Visibility;
   mutable: number;
   deleted_at: string | null;
@@ -108,15 +114,6 @@ export type Visibility = "public" | "unlisted" | "private";
 
 export type TrustTier = "unverified" | "structural" | "source_linked" | "reviewed" | "verified";
 
-export interface PublisherRow {
-  id: string;
-  kind: "user" | "org";
-  user_id: string | null;
-  org_id: string | null;
-  slug: string;
-  created_at: string;
-}
-
 export interface DistTagRow {
   id: string;
   package_id: string;
@@ -162,7 +159,7 @@ export interface SearchDigestRow {
   latest_version: string;
   downloads: number;
   trust_tier: TrustTier;
-  publisher_slug: string;
+  owner_slug: string;
   score: number;
   updated_at: string;
 }
@@ -204,8 +201,10 @@ export type TransferStatus = "pending" | "accepted" | "declined" | "expired" | "
 export interface TransferRequestRow {
   id: string;
   package_id: string;
-  from_publisher_id: string;
-  to_publisher_id: string;
+  from_owner_type: OwnerType;
+  from_owner_id: string;
+  to_owner_type: OwnerType;
+  to_owner_id: string;
   initiated_by: string;
   status: TransferStatus;
   message: string;
@@ -269,6 +268,17 @@ export interface CollectionMemberRow {
   member_path: string;
   display_order: number;
   created_at: string;
+}
+
+// Package claim (system packages → user)
+export interface PackageClaimRow {
+  id: string;
+  package_id: string;
+  claimant_id: string;
+  github_repo: string;
+  status: "pending" | "approved" | "rejected";
+  created_at: string;
+  resolved_at: string | null;
 }
 
 // Source sync tracking for scanner-imported packages

@@ -14,7 +14,7 @@ function mapServerRow(row: Record<string, unknown>) {
     transport: row.transport ?? "stdio",
     tools_count: parseJsonArray(row.tools as string).length,
     downloads: row.downloads as number,
-    publisher_slug: row.publisher_slug ?? "",
+    owner_slug: row.owner_slug ?? "",
     category: row.category ?? "other",
     version: row.version ?? "",
   };
@@ -61,13 +61,14 @@ app.get("/v1/mcp/hub", async (c) => {
   const serversQuery = `
     SELECT p.full_name, p.description, p.downloads, p.created_at,
            mm.transport, mm.tools, mm.category,
-           pub.slug as publisher_slug,
+           COALESCE(u.username, o.name, 'system') as owner_slug,
            v.version
     FROM packages p
     JOIN dist_tags dt ON dt.package_id = p.id AND dt.tag = 'latest'
     JOIN versions v ON dt.version_id = v.id
     LEFT JOIN mcp_metadata mm ON mm.version_id = v.id
-    LEFT JOIN publishers pub ON p.publisher_id = pub.id
+    LEFT JOIN users u ON p.owner_type = 'user' AND p.owner_id = u.id
+    LEFT JOIN orgs o ON p.owner_type = 'org' AND p.owner_id = o.id
     WHERE ${where}
     ORDER BY ${orderBy}
     LIMIT ? OFFSET ?
@@ -106,13 +107,14 @@ app.get("/v1/mcp/featured", async (c) => {
   const result = await c.env.DB.prepare(`
     SELECT p.full_name, p.description, p.downloads,
            mm.transport, mm.tools, mm.category,
-           pub.slug as publisher_slug,
+           COALESCE(u.username, o.name, 'system') as owner_slug,
            v.version
     FROM packages p
     JOIN dist_tags dt ON dt.package_id = p.id AND dt.tag = 'latest'
     JOIN versions v ON dt.version_id = v.id
     LEFT JOIN mcp_metadata mm ON mm.version_id = v.id
-    LEFT JOIN publishers pub ON p.publisher_id = pub.id
+    LEFT JOIN users u ON p.owner_type = 'user' AND p.owner_id = u.id
+    LEFT JOIN orgs o ON p.owner_type = 'org' AND p.owner_id = o.id
     WHERE p.type = 'mcp' AND p.visibility = 'public' AND p.deleted_at IS NULL
     ORDER BY p.downloads DESC
     LIMIT 6

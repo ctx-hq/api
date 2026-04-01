@@ -2,8 +2,8 @@ import { Hono } from "hono";
 import type { AppEnv } from "../bindings";
 import { authMiddleware } from "../middleware/auth";
 import { badRequest, notFound, forbidden, conflict } from "../utils/errors";
-import type { PublisherRow } from "../models/types";
-import { getPublisherForScope, getPublisherBySlug, canPublish } from "../services/publisher";
+import type { OwnerType } from "../models/types";
+import { canPublish, getOwnerForScope, getOwnerSlug } from "../services/ownership";
 import {
   createTransferRequest,
   acceptTransfer,
@@ -12,7 +12,7 @@ import {
   listIncomingTransfers,
   expirePendingTransfers,
 } from "../services/transfer";
-import { notifyPublisherOwners, notify } from "../services/notification";
+import { notifyOwnerOwners, notify } from "../services/notification";
 
 const app = new Hono<AppEnv>();
 
@@ -35,38 +35,33 @@ app.post("/v1/packages/:fullName/transfer", authMiddleware, async (c) => {
 
   // Find the package
   const pkg = await c.env.DB.prepare(
-    "SELECT id, publisher_id, scope, name, full_name FROM packages WHERE full_name = ? AND deleted_at IS NULL",
-  ).bind(fullName).first<{ id: string; publisher_id: string; scope: string; name: string; full_name: string }>();
+    "SELECT id, owner_type, owner_id, scope, name, full_name FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+  ).bind(fullName).first<{ id: string; owner_type: string; owner_id: string; scope: string; name: string; full_name: string }>();
 
   if (!pkg) throw notFound(`Package ${fullName} not found`);
 
-  // Check caller can manage this package (is owner/admin of the publisher)
-  const fromPublisher = await c.env.DB.prepare(
-    "SELECT * FROM publishers WHERE id = ?",
-  ).bind(pkg.publisher_id).first<PublisherRow>();
-
-  if (!fromPublisher) throw notFound("Package publisher not found");
-
-  const canManage = await canPublish(c.env.DB, user.id, fromPublisher);
-  if (!canManage) throw forbidden("You don't have permission to transfer this package");
+  // Check caller can manage this package (scope-based)
+  if (!(await canPublish(c.env.DB, user.id, pkg.scope))) {
+    throw forbidden("You don't have permission to transfer this package");
+  }
 
   // For org packages, only owner/admin can transfer (not regular members)
-  if (fromPublisher.kind === "org" && fromPublisher.org_id) {
+  if (pkg.owner_type === "org") {
     const membership = await c.env.DB.prepare(
       "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
-    ).bind(fromPublisher.org_id, user.id).first<{ role: string }>();
+    ).bind(pkg.owner_id, user.id).first<{ role: string }>();
 
     if (!membership || !["owner", "admin"].includes(membership.role)) {
       throw forbidden("Only org owners and admins can transfer packages");
     }
   }
 
-  // Find target publisher
-  const toPublisher = await getPublisherBySlug(c.env.DB, targetScope);
-  if (!toPublisher) throw notFound(`Target scope @${targetScope} not found`);
+  // Find target scope owner
+  const toOwner = await getOwnerForScope(c.env.DB, targetScope);
+  if (!toOwner) throw notFound(`Target scope @${targetScope} not found`);
 
   // Cannot transfer to self
-  if (toPublisher.id === fromPublisher.id) {
+  if (toOwner.owner_type === pkg.owner_type && toOwner.owner_id === pkg.owner_id) {
     throw badRequest("Cannot transfer a package to its current owner");
   }
 
@@ -90,23 +85,28 @@ app.post("/v1/packages/:fullName/transfer", authMiddleware, async (c) => {
     throw conflict("This package already has a pending transfer request");
   }
 
+  const fromSlug = await getOwnerSlug(c.env.DB, { owner_type: pkg.owner_type as OwnerType, owner_id: pkg.owner_id });
+
   const transfer = await createTransferRequest(
     c.env.DB,
     pkg.id,
-    fromPublisher.id,
-    toPublisher.id,
+    pkg.owner_type as OwnerType,
+    pkg.owner_id,
+    toOwner.owner_type,
+    toOwner.owner_id,
     user.id,
     body.message ?? "",
   );
 
-  // Notify target publisher owner(s)
-  await notifyPublisherOwners(
+  // Notify target owner(s)
+  await notifyOwnerOwners(
     c.env.DB,
-    toPublisher.id,
+    toOwner.owner_type,
+    toOwner.owner_id,
     "transfer_request",
     `Package transfer request: ${pkg.full_name}`,
     `${user.username} wants to transfer ${pkg.full_name} to @${targetScope}`,
-    { transfer_id: transfer.id, package_name: pkg.full_name, from: fromPublisher.slug, to: targetScope },
+    { transfer_id: transfer.id, package_name: pkg.full_name, from: fromSlug, to: targetScope },
   );
 
   // Audit
@@ -116,13 +116,13 @@ app.post("/v1/packages/:fullName/transfer", authMiddleware, async (c) => {
     `evt-${crypto.randomUUID().replace(/-/g, "")}`,
     user.id,
     pkg.id,
-    JSON.stringify({ from: fromPublisher.slug, to: targetScope, transfer_id: transfer.id }),
+    JSON.stringify({ from: fromSlug, to: targetScope, transfer_id: transfer.id }),
   ).run();
 
   return c.json({
     id: transfer.id,
     package: pkg.full_name,
-    from: `@${fromPublisher.slug}`,
+    from: `@${fromSlug}`,
     to: `@${targetScope}`,
     status: "pending",
     expires_at: transfer.expires_at,
@@ -135,26 +135,21 @@ app.delete("/v1/packages/:fullName/transfer", authMiddleware, async (c) => {
   const fullName = c.req.param("fullName");
 
   const pkg = await c.env.DB.prepare(
-    "SELECT id, publisher_id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
-  ).bind(fullName).first<{ id: string; publisher_id: string }>();
+    "SELECT id, owner_type, owner_id, scope FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+  ).bind(fullName).first<{ id: string; owner_type: string; owner_id: string; scope: string }>();
 
   if (!pkg) throw notFound(`Package ${fullName} not found`);
 
-  // Check caller is owner/admin of the publisher
-  const publisher = await c.env.DB.prepare(
-    "SELECT * FROM publishers WHERE id = ?",
-  ).bind(pkg.publisher_id).first<PublisherRow>();
-
-  if (!publisher) throw notFound("Package publisher not found");
-
-  const canManage = await canPublish(c.env.DB, user.id, publisher);
-  if (!canManage) throw forbidden("You don't have permission to cancel this transfer");
+  // Check caller is owner/admin of the scope
+  if (!(await canPublish(c.env.DB, user.id, pkg.scope))) {
+    throw forbidden("You don't have permission to cancel this transfer");
+  }
 
   // For org packages, only owner/admin can cancel
-  if (publisher.kind === "org" && publisher.org_id) {
+  if (pkg.owner_type === "org") {
     const membership = await c.env.DB.prepare(
       "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
-    ).bind(publisher.org_id, user.id).first<{ role: string }>();
+    ).bind(pkg.owner_id, user.id).first<{ role: string }>();
 
     if (!membership || !["owner", "admin"].includes(membership.role)) {
       throw forbidden("Only org owners and admins can cancel transfers");
@@ -191,36 +186,33 @@ app.post("/v1/me/transfers/:id/accept", authMiddleware, async (c) => {
   const user = c.get("user");
   const transferId = c.req.param("id")!;
 
-  // Verify caller is owner/admin of target publisher
+  // Verify caller is owner/admin of target
   const transfer = await c.env.DB.prepare(
     "SELECT * FROM transfer_requests WHERE id = ?",
   ).bind(transferId).first<{
-    id: string; package_id: string; from_publisher_id: string;
-    to_publisher_id: string; initiated_by: string; status: string;
+    id: string; package_id: string; to_owner_type: string;
+    to_owner_id: string; initiated_by: string; status: string;
   }>();
 
   if (!transfer || transfer.status !== "pending") {
     throw notFound("Transfer not found or not pending");
   }
 
-  const toPublisher = await c.env.DB.prepare(
-    "SELECT * FROM publishers WHERE id = ?",
-  ).bind(transfer.to_publisher_id).first<PublisherRow>();
-
-  if (!toPublisher) throw notFound("Target publisher not found");
-
-  const canManage = await canPublish(c.env.DB, user.id, toPublisher);
-  if (!canManage) throw forbidden("You don't have permission to accept this transfer");
-
-  // For org targets, only owner/admin can accept
-  if (toPublisher.kind === "org" && toPublisher.org_id) {
+  // Check caller has access to target owner
+  if (transfer.to_owner_type === "user") {
+    if (transfer.to_owner_id !== user.id) {
+      throw forbidden("You don't have permission to accept this transfer");
+    }
+  } else if (transfer.to_owner_type === "org") {
     const membership = await c.env.DB.prepare(
       "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
-    ).bind(toPublisher.org_id, user.id).first<{ role: string }>();
+    ).bind(transfer.to_owner_id, user.id).first<{ role: string }>();
 
     if (!membership || !["owner", "admin"].includes(membership.role)) {
       throw forbidden("Only org owners and admins can accept transfers");
     }
+  } else {
+    throw forbidden("You don't have permission to accept this transfer");
   }
 
   // Save old full_name before accept (acceptTransfer updates it)
@@ -273,36 +265,33 @@ app.post("/v1/me/transfers/:id/decline", authMiddleware, async (c) => {
   const user = c.get("user");
   const transferId = c.req.param("id")!;
 
-  // Verify caller is owner/admin of target publisher
+  // Verify caller is owner/admin of target
   const transfer = await c.env.DB.prepare(
     "SELECT * FROM transfer_requests WHERE id = ?",
   ).bind(transferId).first<{
-    id: string; to_publisher_id: string; initiated_by: string;
-    package_id: string; status: string;
+    id: string; to_owner_type: string; to_owner_id: string;
+    initiated_by: string; package_id: string; status: string;
   }>();
 
   if (!transfer || transfer.status !== "pending") {
     throw notFound("Transfer not found or not pending");
   }
 
-  const toPublisher = await c.env.DB.prepare(
-    "SELECT * FROM publishers WHERE id = ?",
-  ).bind(transfer.to_publisher_id).first<PublisherRow>();
-
-  if (!toPublisher) throw notFound("Target publisher not found");
-
-  const canManage = await canPublish(c.env.DB, user.id, toPublisher);
-  if (!canManage) throw forbidden("You don't have permission to decline this transfer");
-
-  // For org targets, only owner/admin can decline
-  if (toPublisher.kind === "org" && toPublisher.org_id) {
+  // Check caller has access to target owner
+  if (transfer.to_owner_type === "user") {
+    if (transfer.to_owner_id !== user.id) {
+      throw forbidden("You don't have permission to decline this transfer");
+    }
+  } else if (transfer.to_owner_type === "org") {
     const membership = await c.env.DB.prepare(
       "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
-    ).bind(toPublisher.org_id, user.id).first<{ role: string }>();
+    ).bind(transfer.to_owner_id, user.id).first<{ role: string }>();
 
     if (!membership || !["owner", "admin"].includes(membership.role)) {
       throw forbidden("Only org owners and admins can decline transfers");
     }
+  } else {
+    throw forbidden("You don't have permission to decline this transfer");
   }
 
   const declined = await declineTransfer(c.env.DB, transferId, user.id);

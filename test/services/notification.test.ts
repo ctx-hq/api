@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   notify,
-  notifyPublisherOwners,
+  notifyOwnerOwners,
   listNotifications,
   getUnreadCount,
   markRead,
@@ -144,40 +144,26 @@ describe("notification service", () => {
     });
   });
 
-  describe("notifyPublisherOwners", () => {
-    it("should notify user_id for user publisher", async () => {
-      const db = createMockDB({
-        firstFn: (sql, params) => {
-          if (sql.includes("FROM publishers")) {
-            return { id: "pub-1", kind: "user", user_id: "user-42", org_id: null, slug: "alice" };
-          }
-          return null;
-        },
-      });
+  describe("notifyOwnerOwners", () => {
+    it("should notify user directly for user owner", async () => {
+      const db = createMockDB();
 
-      await notifyPublisherOwners(
+      await notifyOwnerOwners(
         db as unknown as D1Database,
-        "pub-1",
+        "user",
+        "user-42",
         "transfer_completed",
         "Transfer done",
         "Package transferred",
       );
 
-      // Should have queried publishers, then inserted a notification for user-42
       const insertStmt = db._executed.find((e) => e.sql.includes("INSERT INTO notifications"));
       expect(insertStmt).toBeDefined();
       expect(insertStmt!.params[1]).toBe("user-42");
     });
 
-    it("should notify all org owners for org publisher", async () => {
-      const owners: string[] = [];
+    it("should notify all org owners for org owner", async () => {
       const db = createMockDB({
-        firstFn: (sql, params) => {
-          if (sql.includes("FROM publishers")) {
-            return { id: "pub-org-1", kind: "org", user_id: null, org_id: "org-1", slug: "team" };
-          }
-          return null;
-        },
         allFn: (sql, params) => {
           if (sql.includes("org_members")) {
             return [{ user_id: "owner-1" }, { user_id: "owner-2" }];
@@ -186,9 +172,10 @@ describe("notification service", () => {
         },
       });
 
-      await notifyPublisherOwners(
+      await notifyOwnerOwners(
         db as unknown as D1Database,
-        "pub-org-1",
+        "org",
+        "org-1",
         "member_joined",
         "New member",
         "Someone joined",
@@ -200,14 +187,13 @@ describe("notification service", () => {
       expect(inserts[1].params[1]).toBe("owner-2");
     });
 
-    it("should do nothing if publisher not found", async () => {
-      const db = createMockDB({
-        firstFn: () => null,
-      });
+    it("should do nothing for system owner type", async () => {
+      const db = createMockDB();
 
-      await notifyPublisherOwners(
+      await notifyOwnerOwners(
         db as unknown as D1Database,
-        "pub-nonexistent",
+        "system",
+        "system-id",
         "system_notice",
         "Test",
         "Test",

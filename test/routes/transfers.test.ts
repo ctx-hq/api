@@ -56,33 +56,20 @@ function createMockDB(overrides?: {
 
 const mockPkg = {
   id: "pkg-1",
-  publisher_id: "pub-alice",
+  owner_type: "user",
+  owner_id: "user-1",
   scope: "alice",
   name: "my-tool",
   full_name: "@alice/my-tool",
 };
 
-const mockFromPublisher = {
-  id: "pub-alice",
-  kind: "user",
-  user_id: "user-1",
-  org_id: null,
-  slug: "alice",
-};
-
-const mockToPublisher = {
-  id: "pub-bob",
-  kind: "user",
-  user_id: "user-2",
-  org_id: null,
-  slug: "bob",
-};
-
 const mockTransfer = {
   id: "xfer-123",
   package_id: "pkg-1",
-  from_publisher_id: "pub-alice",
-  to_publisher_id: "pub-bob",
+  from_owner_type: "user",
+  from_owner_id: "user-1",
+  to_owner_type: "user",
+  to_owner_id: "user-2",
   initiated_by: "user-1",
   status: "pending",
   message: "",
@@ -97,22 +84,23 @@ const mockTransfer = {
 function createTransferApp(opts?: {
   user?: { id: string; username: string };
   pkg?: typeof mockPkg | null;
-  fromPublisher?: typeof mockFromPublisher | null;
-  toPublisher?: typeof mockToPublisher | null;
   transfer?: typeof mockTransfer | null;
   existingTransfer?: boolean;
   nameCollision?: boolean;
   orgStatus?: string;
+  /** Override to_owner_id for self-transfer test */
+  toOwnerId?: string;
+  toOwnerType?: string;
 }) {
   const {
     user,
     pkg = mockPkg,
-    fromPublisher = mockFromPublisher,
-    toPublisher = mockToPublisher,
     transfer = null,
     existingTransfer = false,
     nameCollision = false,
     orgStatus = "active",
+    toOwnerId = "user-2",
+    toOwnerType = "user",
   } = opts ?? {};
 
   const db = createMockDB({
@@ -126,20 +114,7 @@ function createTransferApp(opts?: {
         return pkg;
       }
       if (sql.includes("FROM packages WHERE id")) {
-        return pkg ? { full_name: pkg.full_name } : null;
-      }
-      // Publisher lookups
-      if (sql.includes("FROM publishers WHERE id")) {
-        const id = params[0] as string;
-        if (id === fromPublisher?.id) return fromPublisher;
-        if (id === toPublisher?.id) return toPublisher;
-        // For notifyPublisherOwners
-        return toPublisher;
-      }
-      if (sql.includes("FROM publishers WHERE slug")) {
-        const slug = params[0] as string;
-        if (slug === toPublisher?.slug) return toPublisher;
-        return null;
+        return pkg ? { id: pkg.id, full_name: pkg.full_name, name: pkg.name, scope: pkg.scope } : null;
       }
       // Org membership (for canPublish)
       if (sql.includes("org_members WHERE org_id") && sql.includes("user_id")) {
@@ -157,9 +132,21 @@ function createTransferApp(opts?: {
       if (sql.includes("FROM transfer_requests WHERE package_id") && sql.includes("pending")) {
         return existingTransfer ? { id: "xfer-existing" } : null;
       }
-      // Scope lookup
+      // Scope lookup: for getOwnerForScope (target scope) and canPublish (source scope)
       if (sql.includes("FROM scopes WHERE name")) {
-        return { name: "bob", publisher_id: toPublisher?.id };
+        const scopeName = params[0] as string;
+        // Source scope (alice)
+        if (pkg && scopeName === pkg.scope) {
+          return { name: pkg.scope, owner_type: pkg.owner_type, owner_id: pkg.owner_id };
+        }
+        // Target scope (bob)
+        return { name: scopeName, owner_type: toOwnerType, owner_id: toOwnerId };
+      }
+      // getOwnerSlug for user owner — differentiate by user ID
+      if (sql.includes("FROM users WHERE id")) {
+        const userId = params[0] as string;
+        if (userId === toOwnerId) return { username: "bob" };
+        return { username: pkg?.scope ?? "alice" };
       }
       return null;
     },
@@ -173,7 +160,7 @@ function createTransferApp(opts?: {
           to_slug: "bob",
         }] : [];
       }
-      // For notifyPublisherOwners - org owners
+      // For notifyOwnerOwners - org owners
       if (sql.includes("FROM org_members") && sql.includes("owner")) {
         return [{ user_id: "user-2" }];
       }
@@ -200,9 +187,10 @@ function createTransferApp(opts?: {
   // --- Initiate transfer (mirrors src/routes/transfers.ts) ---
   app.post("/v1/packages/:fullName/transfer", async (c) => {
     const { badRequest, notFound, forbidden, conflict } = await import("../../src/utils/errors");
-    const { canPublish, getPublisherBySlug } = await import("../../src/services/publisher");
+    const { canPublish, getOwnerForScope, getOwnerSlug } = await import("../../src/services/ownership");
     const { createTransferRequest, expirePendingTransfers } = await import("../../src/services/transfer");
-    const { notifyPublisherOwners } = await import("../../src/services/notification");
+    const { notifyOwnerOwners } = await import("../../src/services/notification");
+    type OwnerType = import("../../src/models/types").OwnerType;
 
     const u = c.get("user");
     if (!u) throw new (await import("../../src/utils/errors")).AppError(401, "Unauthorized", "unauthorized");
@@ -216,24 +204,18 @@ function createTransferApp(opts?: {
     const targetScope = body.to.startsWith("@") ? body.to.slice(1) : body.to;
 
     const foundPkg = await c.env.DB.prepare(
-      "SELECT id, publisher_id, scope, name, full_name FROM packages WHERE full_name = ? AND deleted_at IS NULL",
-    ).bind(fullName).first<{ id: string; publisher_id: string; scope: string; name: string; full_name: string }>();
+      "SELECT id, owner_type, owner_id, scope, name, full_name FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+    ).bind(fullName).first<{ id: string; owner_type: string; owner_id: string; scope: string; name: string; full_name: string }>();
 
     if (!foundPkg) throw notFound(`Package ${fullName} not found`);
 
-    const publisher = await c.env.DB.prepare(
-      "SELECT * FROM publishers WHERE id = ?",
-    ).bind(foundPkg.publisher_id).first<{ id: string; kind: string; user_id: string | null; org_id: string | null; slug: string }>();
-
-    if (!publisher) throw notFound("Package publisher not found");
-
-    const canManage = await canPublish(c.env.DB as any, u.id, publisher as any);
+    const canManage = await canPublish(c.env.DB as any, u.id, foundPkg.scope);
     if (!canManage) throw forbidden("You don't have permission to transfer this package");
 
-    const targetPub = await getPublisherBySlug(c.env.DB as any, targetScope);
-    if (!targetPub) throw notFound(`Target scope @${targetScope} not found`);
+    const toOwner = await getOwnerForScope(c.env.DB as any, targetScope);
+    if (!toOwner) throw notFound(`Target scope @${targetScope} not found`);
 
-    if (targetPub.id === publisher.id) {
+    if (toOwner.owner_type === foundPkg.owner_type && toOwner.owner_id === foundPkg.owner_id) {
       throw badRequest("Cannot transfer a package to its current owner");
     }
 
@@ -250,15 +232,20 @@ function createTransferApp(opts?: {
 
     await expirePendingTransfers(c.env.DB as any);
 
+    const fromSlug = await getOwnerSlug(c.env.DB as any, { owner_type: foundPkg.owner_type as OwnerType, owner_id: foundPkg.owner_id });
+
     const xfer = await createTransferRequest(
-      c.env.DB as any, foundPkg.id, publisher.id, targetPub.id, u.id, body.message ?? "",
+      c.env.DB as any, foundPkg.id,
+      foundPkg.owner_type as OwnerType, foundPkg.owner_id,
+      toOwner.owner_type, toOwner.owner_id,
+      u.id, body.message ?? "",
     );
 
-    await notifyPublisherOwners(
-      c.env.DB as any, targetPub.id, "transfer_request",
+    await notifyOwnerOwners(
+      c.env.DB as any, toOwner.owner_type, toOwner.owner_id, "transfer_request",
       `Package transfer request: ${foundPkg.full_name}`,
       `${u.username} wants to transfer ${foundPkg.full_name} to @${targetScope}`,
-      { transfer_id: xfer.id, package_name: foundPkg.full_name, from: publisher.slug, to: targetScope },
+      { transfer_id: xfer.id, package_name: foundPkg.full_name, from: fromSlug, to: targetScope },
     );
 
     await c.env.DB.prepare(
@@ -268,7 +255,7 @@ function createTransferApp(opts?: {
     return c.json({
       id: xfer.id,
       package: foundPkg.full_name,
-      from: `@${publisher.slug}`,
+      from: `@${fromSlug}`,
       to: `@${targetScope}`,
       status: "pending",
       expires_at: xfer.expires_at,
@@ -278,7 +265,7 @@ function createTransferApp(opts?: {
   // --- Cancel transfer ---
   app.delete("/v1/packages/:fullName/transfer", async (c) => {
     const { notFound, forbidden } = await import("../../src/utils/errors");
-    const { canPublish } = await import("../../src/services/publisher");
+    const { canPublish } = await import("../../src/services/ownership");
     const { cancelTransfer } = await import("../../src/services/transfer");
 
     const u = c.get("user");
@@ -286,16 +273,12 @@ function createTransferApp(opts?: {
     const fullName = c.req.param("fullName");
 
     const foundPkg = await c.env.DB.prepare(
-      "SELECT id, publisher_id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
-    ).bind(fullName).first<{ id: string; publisher_id: string }>();
+      "SELECT id, owner_type, owner_id, scope FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+    ).bind(fullName).first<{ id: string; owner_type: string; owner_id: string; scope: string }>();
 
     if (!foundPkg) throw notFound(`Package ${fullName} not found`);
 
-    const publisher = await c.env.DB.prepare(
-      "SELECT * FROM publishers WHERE id = ?",
-    ).bind(foundPkg.publisher_id).first();
-
-    const canManage = publisher ? await canPublish(c.env.DB as any, u.id, publisher as any) : false;
+    const canManage = await canPublish(c.env.DB as any, u.id, foundPkg.scope);
     if (!canManage) throw forbidden("You don't have permission to cancel this transfer");
 
     const cancelled = await cancelTransfer(c.env.DB as any, foundPkg.id, u.id);
@@ -330,7 +313,6 @@ function createTransferApp(opts?: {
   // --- Accept transfer ---
   app.post("/v1/me/transfers/:id/accept", async (c) => {
     const { notFound, forbidden } = await import("../../src/utils/errors");
-    const { canPublish } = await import("../../src/services/publisher");
     const { acceptTransfer } = await import("../../src/services/transfer");
     const { notify } = await import("../../src/services/notification");
 
@@ -341,22 +323,29 @@ function createTransferApp(opts?: {
     const xfer = await c.env.DB.prepare(
       "SELECT * FROM transfer_requests WHERE id = ?",
     ).bind(transferId).first<{
-      id: string; package_id: string; from_publisher_id: string;
-      to_publisher_id: string; initiated_by: string; status: string;
+      id: string; package_id: string; to_owner_type: string;
+      to_owner_id: string; initiated_by: string; status: string;
     }>();
 
     if (!xfer || xfer.status !== "pending") {
       throw notFound("Transfer not found or not pending");
     }
 
-    const targetPub = await c.env.DB.prepare(
-      "SELECT * FROM publishers WHERE id = ?",
-    ).bind(xfer.to_publisher_id).first();
-
-    if (!targetPub) throw notFound("Target publisher not found");
-
-    const canManage = await canPublish(c.env.DB as any, u.id, targetPub as any);
-    if (!canManage) throw forbidden("You don't have permission to accept this transfer");
+    // Check caller has access to target owner
+    if (xfer.to_owner_type === "user") {
+      if (xfer.to_owner_id !== u.id) {
+        throw forbidden("You don't have permission to accept this transfer");
+      }
+    } else if (xfer.to_owner_type === "org") {
+      const membership = await c.env.DB.prepare(
+        "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+      ).bind(xfer.to_owner_id, u.id).first<{ role: string }>();
+      if (!membership || !["owner", "admin"].includes(membership.role)) {
+        throw forbidden("Only org owners and admins can accept transfers");
+      }
+    } else {
+      throw forbidden("You don't have permission to accept this transfer");
+    }
 
     const result = await acceptTransfer(c.env.DB as any, transferId, u.id);
     if (!result) throw notFound("Transfer not found, expired, or already resolved");
@@ -382,7 +371,6 @@ function createTransferApp(opts?: {
   // --- Decline transfer ---
   app.post("/v1/me/transfers/:id/decline", async (c) => {
     const { notFound, forbidden } = await import("../../src/utils/errors");
-    const { canPublish } = await import("../../src/services/publisher");
     const { declineTransfer } = await import("../../src/services/transfer");
     const { notify } = await import("../../src/services/notification");
 
@@ -393,22 +381,29 @@ function createTransferApp(opts?: {
     const xfer = await c.env.DB.prepare(
       "SELECT * FROM transfer_requests WHERE id = ?",
     ).bind(transferId).first<{
-      id: string; to_publisher_id: string; initiated_by: string;
-      package_id: string; status: string;
+      id: string; to_owner_type: string; to_owner_id: string;
+      initiated_by: string; package_id: string; status: string;
     }>();
 
     if (!xfer || xfer.status !== "pending") {
       throw notFound("Transfer not found or not pending");
     }
 
-    const targetPub = await c.env.DB.prepare(
-      "SELECT * FROM publishers WHERE id = ?",
-    ).bind(xfer.to_publisher_id).first();
-
-    if (!targetPub) throw notFound("Target publisher not found");
-
-    const canManage = await canPublish(c.env.DB as any, u.id, targetPub as any);
-    if (!canManage) throw forbidden("You don't have permission to decline this transfer");
+    // Check caller has access to target owner
+    if (xfer.to_owner_type === "user") {
+      if (xfer.to_owner_id !== u.id) {
+        throw forbidden("You don't have permission to decline this transfer");
+      }
+    } else if (xfer.to_owner_type === "org") {
+      const membership = await c.env.DB.prepare(
+        "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
+      ).bind(xfer.to_owner_id, u.id).first<{ role: string }>();
+      if (!membership || !["owner", "admin"].includes(membership.role)) {
+        throw forbidden("Only org owners and admins can decline transfers");
+      }
+    } else {
+      throw forbidden("You don't have permission to decline this transfer");
+    }
 
     const declined = await declineTransfer(c.env.DB as any, transferId, u.id);
     if (!declined) throw notFound("Transfer not found or not pending");
@@ -491,10 +486,9 @@ describe("POST /v1/packages/:fullName/transfer — initiate transfer", () => {
   });
 
   it("not authorized returns 403", async () => {
-    // user-999 does not own the package's publisher
+    // user-999 does not own the package's scope
     const { app } = createTransferApp({
       user: { id: "user-999", username: "mallory" },
-      fromPublisher: { id: "pub-alice", kind: "user", user_id: "user-1", org_id: null, slug: "alice" },
     });
 
     const res = await app.request(`${encodePkgPath("@alice/my-tool")}/transfer`, {
@@ -507,10 +501,11 @@ describe("POST /v1/packages/:fullName/transfer — initiate transfer", () => {
   });
 
   it("transfer to self returns 400", async () => {
-    // toPublisher has same id as fromPublisher
+    // toOwner matches fromOwner (same type+id)
     const { app } = createTransferApp({
       user: { id: "user-1", username: "alice" },
-      toPublisher: { id: "pub-alice", kind: "user", user_id: "user-1", org_id: null, slug: "alice" },
+      toOwnerId: "user-1",
+      toOwnerType: "user",
     });
 
     const res = await app.request(`${encodePkgPath("@alice/my-tool")}/transfer`, {
@@ -564,7 +559,6 @@ describe("POST /v1/me/transfers/:id/accept — accept transfer", () => {
     const { app, db } = createTransferApp({
       user: { id: "user-2", username: "bob" },
       transfer: mockTransfer,
-      toPublisher: { id: "pub-bob", kind: "user", user_id: "user-2", org_id: null, slug: "bob" },
     });
 
     const res = await app.request("/v1/me/transfers/xfer-123/accept", {
@@ -591,7 +585,6 @@ describe("POST /v1/me/transfers/:id/decline — decline transfer", () => {
     const { app } = createTransferApp({
       user: { id: "user-2", username: "bob" },
       transfer: mockTransfer,
-      toPublisher: { id: "pub-bob", kind: "user", user_id: "user-2", org_id: null, slug: "bob" },
     });
 
     const res = await app.request("/v1/me/transfers/xfer-123/decline", {

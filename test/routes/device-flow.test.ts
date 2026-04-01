@@ -28,10 +28,6 @@ vi.mock("../../src/middleware/auth", () => ({
   },
 }));
 
-vi.mock("../../src/services/publisher", () => ({
-  getOrCreatePublisher: async () => ({ id: "pub-mock", kind: "user", slug: "testuser" }),
-}));
-
 // Import actual routes AFTER mocks are set up
 import authRoutes from "../../src/routes/auth";
 
@@ -381,7 +377,7 @@ describe("POST /v1/auth/token — token polling", () => {
     expect(body.scope).toBe("read write");
   });
 
-  it("creates user + publisher + API token in DB for new user", async () => {
+  it("creates user + scope + API token in DB for new user", async () => {
     const cache = createMockKV();
     const db = createMockDB(); // firstFn returns null → user not found → creates new
     const app = createTestApp(cache, db);

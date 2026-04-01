@@ -3,7 +3,7 @@ import type { AppEnv } from "../bindings";
 import { authMiddleware, optionalAuth } from "../middleware/auth";
 import { badRequest, forbidden, notFound } from "../utils/errors";
 import { generateId } from "../utils/response";
-import { canPublish, getPublisherForScope, canAccessPackage } from "../services/publisher";
+import { canPublish, canAccessPackage } from "../services/ownership";
 import { parseFullName } from "../utils/naming";
 
 const app = new Hono<AppEnv>();
@@ -13,7 +13,7 @@ app.get("/v1/packages/:fullName/tags", optionalAuth, async (c) => {
   const fullName = decodeURIComponent(c.req.param("fullName")!);
 
   const pkg = await c.env.DB.prepare(
-    "SELECT id, visibility, publisher_id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+    "SELECT id, visibility, owner_type, owner_id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
   )
     .bind(fullName)
     .first();
@@ -64,12 +64,11 @@ app.put("/v1/packages/:fullName/tags/:tag", authMiddleware, async (c) => {
 
   if (!pkg) throw notFound(`Package ${fullName} not found`);
 
-  // Auth: must be publisher member
+  // Auth: must be scope member
   const parsed = parseFullName(fullName);
   if (!parsed) throw badRequest("Invalid package name");
 
-  const publisher = await getPublisherForScope(c.env.DB, parsed.scope);
-  if (!publisher || !(await canPublish(c.env.DB, user.id, publisher))) {
+  if (!(await canPublish(c.env.DB, user.id, parsed.scope))) {
     throw forbidden("You don't have permission to manage tags for this package");
   }
 
@@ -121,8 +120,7 @@ app.delete("/v1/packages/:fullName/tags/:tag", authMiddleware, async (c) => {
   const parsed = parseFullName(fullName);
   if (!parsed) throw badRequest("Invalid package name");
 
-  const publisher = await getPublisherForScope(c.env.DB, parsed.scope);
-  if (!publisher || !(await canPublish(c.env.DB, user.id, publisher))) {
+  if (!(await canPublish(c.env.DB, user.id, parsed.scope))) {
     throw forbidden("You don't have permission to manage tags for this package");
   }
 

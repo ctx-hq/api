@@ -100,7 +100,7 @@ describe("MCP Hub routes", () => {
                 transport: "stdio",
                 tools: '["search","create"]',
                 category: "database",
-                publisher_slug: "test",
+                owner_slug: "test",
                 version: "1.0.0",
               },
             ];
@@ -161,8 +161,8 @@ describe("MCP Hub routes", () => {
         allFn: (sql) => {
           if (sql.includes("LIMIT 6")) {
             return [
-              { full_name: "@test/top1", description: "Top 1", downloads: 500, transport: "stdio", tools: "[]", category: "database", publisher_slug: "pub", version: "2.0.0" },
-              { full_name: "@test/top2", description: "Top 2", downloads: 300, transport: "http", tools: '["fetch"]', category: "search", publisher_slug: "", version: "1.0.0" },
+              { full_name: "@test/top1", description: "Top 1", downloads: 500, transport: "stdio", tools: "[]", category: "database", owner_slug: "pub", version: "2.0.0" },
+              { full_name: "@test/top2", description: "Top 2", downloads: 300, transport: "http", tools: '["fetch"]', category: "search", owner_slug: "", version: "1.0.0" },
             ];
           }
           return [];

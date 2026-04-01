@@ -319,18 +319,18 @@ export async function upsertSearchDigest(
   capabilities: string,
   latestVersion: string,
   downloads: number,
-  publisherSlug: string,
+  ownerSlug: string,
 ): Promise<void> {
   await db
     .prepare(
       `INSERT OR REPLACE INTO search_digest
        (package_id, full_name, type, description, summary, keywords, capabilities,
-        latest_version, downloads, publisher_slug, updated_at)
+        latest_version, downloads, owner_slug, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
     )
     .bind(
       packageId, fullName, type_, description, summary,
-      keywords, capabilities, latestVersion, downloads, publisherSlug,
+      keywords, capabilities, latestVersion, downloads, ownerSlug,
     )
     .run();
 }

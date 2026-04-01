@@ -15,17 +15,17 @@ pnpm deploy       # Deploy to CF Workers
 
 ## Architecture
 
-- `src/routes/` — Hono route handlers (packages, search, publish, resolve, auth, scanner, orgs, agent, download, categories, versions, health, tags, stats, publishers, sync)
-- `src/services/` — Business logic (scanner, importer, enrichment, search, categories, publish, publisher, trust, normalize)
+- `src/routes/` — Hono route handlers (packages, search, publish, resolve, auth, scanner, orgs, agent, download, categories, versions, health, tags, stats, profiles, sync, claims, transfers, mcp)
+- `src/services/` — Business logic (scanner, importer, enrichment, search, categories, publish, ownership, claim, trust, normalize)
 - `src/middleware/` — Auth, security headers, rate limiting
 - `src/utils/` — Naming validation, semver, error types, response helpers
-- `src/models/types.ts` — Shared TypeScript types (PackageRow, PublisherRow, DistTagRow, TrustCheckRow, etc.)
-- `migrations/` — D1 SQL migrations (0001–0010)
+- `src/models/types.ts` — Shared TypeScript types (PackageRow, OwnerType, DistTagRow, TrustCheckRow, etc.)
+- `migrations/` — D1 SQL migrations (0001–0018)
 - `test/` — Vitest test suite (routes, middleware, services)
 
 ## CF Bindings
 
-- **DB** (D1) — Package metadata, users, orgs, publishers, trust checks, stats, audit log
+- **DB** (D1) — Package metadata, users, orgs, trust checks, stats, audit log
 - **FORMULAS** (R2) — Formula archives
 - **CACHE** (KV) — Rate limiting, device flow state, sync profiles
 - **VECTORIZE** (Vectorize) — Package embedding index (public packages only)
@@ -38,7 +38,7 @@ pnpm deploy       # Deploy to CF Workers
 - Token hashing: unsalted SHA-256 (appropriate for high-entropy tokens)
 - Account deletion: soft-delete with unique tombstones, packages reassigned to `system-deleted`
 - Rate limiting: keyed by user_id for authenticated users (prevents multi-token bypass)
-- **Publisher abstraction**: Unified user/org ownership via `publishers` table (kind: user|org). Every user gets a personal publisher; every org gets an org publisher. Packages reference `publisher_id`, not `owner_id` directly.
+- **Direct ownership**: Packages have `owner_type` (user|org|system) + `owner_id` columns. No intermediate publishers table. Scopes map to owners via the `scopes` table. System-owned packages (scanner-imported) can be claimed by users via `/v1/me/claims`.
 - **Visibility**: Per-package `public`/`unlisted`/`private`. Private packages require auth for download, return 404 (not 403) to avoid leaking existence. Private packages are excluded from search and vectorization.
 - **Push/Sync**: `ctx push` = publish with visibility=private, mutable=true. `ctx sync` manages cross-device environment sync via KV-stored profiles with provenance tracking.
 - **Dist-tags**: npm-style named pointers to versions (latest, beta, stable). Auto-set on publish: non-prerelease → latest, prerelease → tag from identifier.

@@ -78,9 +78,7 @@ export async function cleanupUserAccessForOrg(
     .prepare(
       `DELETE FROM package_access WHERE user_id = ?
        AND package_id IN (
-         SELECT id FROM packages WHERE publisher_id IN (
-           SELECT id FROM publishers WHERE org_id = ?
-         )
+         SELECT id FROM packages WHERE owner_type = 'org' AND owner_id = ?
        )`,
     )
     .bind(userId, orgId)

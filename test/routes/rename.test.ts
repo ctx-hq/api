@@ -56,15 +56,13 @@ function createMockDB(overrides?: {
 
 function createPackageRenameApp(opts?: {
   user?: { id: string; username: string };
-  pkg?: { id: string; publisher_id: string; scope: string; name: string; full_name: string } | null;
-  publisher?: { id: string; kind: string; user_id: string | null; org_id: string | null; slug: string } | null;
+  pkg?: { id: string; owner_type: string; owner_id: string; scope: string; name: string; full_name: string } | null;
   orgStatus?: string;
   onCooldown?: boolean;
 }) {
   const {
     user,
-    pkg = { id: "pkg-1", publisher_id: "pub-alice", scope: "alice", name: "my-tool", full_name: "@alice/my-tool" },
-    publisher = { id: "pub-alice", kind: "user", user_id: "user-1", org_id: null, slug: "alice" },
+    pkg = { id: "pkg-1", owner_type: "user", owner_id: "user-1", scope: "alice", name: "my-tool", full_name: "@alice/my-tool" },
     orgStatus = "active",
     onCooldown = false,
   } = opts ?? {};
@@ -81,10 +79,6 @@ function createPackageRenameApp(opts?: {
       if (sql.includes("packages WHERE id =")) {
         return pkg;
       }
-      // Publisher lookup
-      if (sql.includes("FROM publishers WHERE id")) {
-        return publisher;
-      }
       // Org status (canPublish)
       if (sql.includes("FROM orgs WHERE id")) {
         return { status: orgStatus };
@@ -93,8 +87,12 @@ function createPackageRenameApp(opts?: {
       if (sql.includes("org_members WHERE org_id") && sql.includes("user_id")) {
         return { role: "owner" };
       }
-      // Scope check (isNameAvailable)
+      // Scope check: canPublish queries getOwnerForScope, isNameAvailable also queries scopes
       if (sql.includes("FROM scopes WHERE name")) {
+        // Return owner info for the package's scope, null for new name (availability check)
+        if (pkg && params[0] === pkg.scope) {
+          return { name: pkg.scope, owner_type: pkg.owner_type, owner_id: pkg.owner_id };
+        }
         return null;
       }
       // Slug alias conflict check (renamePackage)
@@ -132,7 +130,7 @@ function createPackageRenameApp(opts?: {
   // --- Package rename (mirrors src/routes/packages.ts) ---
   app.patch("/v1/packages/:fullName/rename", async (c) => {
     const { badRequest, notFound, forbidden } = await import("../../src/utils/errors");
-    const { canPublish } = await import("../../src/services/publisher");
+    const { canPublish } = await import("../../src/services/ownership");
     const { renamePackage } = await import("../../src/services/rename");
     const { isValidScope } = await import("../../src/utils/naming");
 
@@ -150,24 +148,18 @@ function createPackageRenameApp(opts?: {
     }
 
     const foundPkg = await c.env.DB.prepare(
-      "SELECT id, publisher_id, scope, name, full_name FROM packages WHERE full_name = ? AND deleted_at IS NULL",
-    ).bind(fullName).first<{ id: string; publisher_id: string; scope: string; name: string; full_name: string }>();
+      "SELECT id, owner_type, owner_id, scope, name, full_name FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+    ).bind(fullName).first<{ id: string; owner_type: string; owner_id: string; scope: string; name: string; full_name: string }>();
 
     if (!foundPkg) throw notFound(`Package ${fullName} not found`);
 
-    const pub = await c.env.DB.prepare(
-      "SELECT * FROM publishers WHERE id = ?",
-    ).bind(foundPkg.publisher_id).first();
-
-    if (!pub) throw notFound("Publisher not found");
-
-    const hasPermission = await canPublish(c.env.DB as any, u.id, pub as any);
+    const hasPermission = await canPublish(c.env.DB as any, u.id, foundPkg.scope);
     if (!hasPermission) throw forbidden("You don't have permission to rename this package");
 
-    if ((pub as any).kind === "org" && (pub as any).org_id) {
+    if (foundPkg.owner_type === "org") {
       const membership = await c.env.DB.prepare(
         "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
-      ).bind((pub as any).org_id, u.id).first<{ role: string }>();
+      ).bind(foundPkg.owner_id, u.id).first<{ role: string }>();
 
       if (!membership || !["owner", "admin"].includes(membership.role)) {
         throw forbidden("Only org owners and admins can rename packages");
@@ -376,7 +368,7 @@ describe("PATCH /v1/packages/:fullName/rename — rename package", () => {
   it("not authorized returns 403", async () => {
     const { app } = createPackageRenameApp({
       user: { id: "user-999", username: "mallory" },
-      publisher: { id: "pub-alice", kind: "user", user_id: "user-1", org_id: null, slug: "alice" },
+      pkg: { id: "pkg-1", owner_type: "user", owner_id: "user-1", scope: "alice", name: "my-tool", full_name: "@alice/my-tool" },
     });
 
     const res = await app.request(`${encodePkgPath("@alice/my-tool")}/rename`, {

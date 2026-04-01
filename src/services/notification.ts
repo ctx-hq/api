@@ -1,4 +1,4 @@
-import type { PublisherRow, NotificationType, NotificationRow } from "../models/types";
+import type { OwnerType, NotificationType, NotificationRow } from "../models/types";
 import { generateId } from "../utils/response";
 
 export type { NotificationType, NotificationRow };
@@ -37,31 +37,25 @@ export async function notify(
 }
 
 /**
- * Notify all owners of a publisher (user publisher → the user; org publisher → all org owners).
+ * Notify all owners of a given owner entity (user → the user; org → all org owners).
  */
-export async function notifyPublisherOwners(
+export async function notifyOwnerOwners(
   db: D1Database,
-  publisherId: string,
+  ownerType: OwnerType,
+  ownerId: string,
   type: NotificationType,
   title: string,
   body: string,
   data: Record<string, unknown> = {},
 ): Promise<void> {
-  const publisher = await db
-    .prepare("SELECT * FROM publishers WHERE id = ?")
-    .bind(publisherId)
-    .first<PublisherRow>();
-
-  if (!publisher) return;
-
-  if (publisher.kind === "user" && publisher.user_id) {
-    await notify(db, publisher.user_id, type, title, body, data);
-  } else if (publisher.kind === "org" && publisher.org_id) {
+  if (ownerType === "user") {
+    await notify(db, ownerId, type, title, body, data);
+  } else if (ownerType === "org") {
     const owners = await db
       .prepare(
         "SELECT user_id FROM org_members WHERE org_id = ? AND role = 'owner'",
       )
-      .bind(publisher.org_id)
+      .bind(ownerId)
       .all<{ user_id: string }>();
 
     for (const owner of owners.results ?? []) {

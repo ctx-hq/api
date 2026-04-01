@@ -17,7 +17,7 @@ interface SearchResult {
   version: string;
   downloads: number;
   trust_tier: string;
-  publisher_slug: string;
+  owner_slug: string;
 }
 
 interface RankedItem {
@@ -150,7 +150,7 @@ async function hydrateResults(
   // Use search_digest for fast hydration (only contains public packages)
   const digestResult = await db.prepare(
     `SELECT package_id, full_name, type, description, summary, latest_version,
-            downloads, trust_tier, publisher_slug
+            downloads, trust_tier, owner_slug
      FROM search_digest WHERE package_id IN (${placeholders})`
   ).bind(...ids).all();
 
@@ -172,7 +172,7 @@ async function hydrateResults(
       version: (sd.latest_version as string) ?? "",
       downloads: sd.downloads as number,
       trust_tier: (sd.trust_tier as string) ?? "unverified",
-      publisher_slug: (sd.publisher_slug as string) ?? "",
+      owner_slug: (sd.owner_slug as string) ?? "",
     });
   }
 

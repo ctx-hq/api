@@ -174,7 +174,7 @@ describe("package access service", () => {
     const query = db._executed.find(
       (e) =>
         e.sql.includes("DELETE FROM package_access WHERE user_id = ?") &&
-        e.sql.includes("publishers WHERE org_id = ?"),
+        e.sql.includes("owner_type = 'org' AND owner_id = ?"),
     );
     expect(query).toBeDefined();
     expect(query!.params[0]).toBe("user-alice");
@@ -226,7 +226,7 @@ describe("package access service", () => {
 describe("package access — canAccessPackage integration logic", () => {
   it("public packages bypass all access checks", () => {
     // canAccessPackage returns true immediately for non-private
-    // This is tested in the publisher service — here we verify the invariant
+    // This is tested in the ownership service — here we verify the invariant
     expect("public").not.toBe("private");
     expect("unlisted").not.toBe("private");
   });

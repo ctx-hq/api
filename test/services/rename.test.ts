@@ -316,7 +316,7 @@ describe("rename service", () => {
   });
 
   describe("renameOrg", () => {
-    it("should cascade to publisher, scope, and all packages", async () => {
+    it("should cascade to scope and all packages", async () => {
       const db = createMockDB({
         firstFn: (sql) => {
           if (sql.includes("FROM orgs")) {
@@ -345,12 +345,6 @@ describe("rename service", () => {
         (e) => e.sql.includes("UPDATE orgs SET name"),
       );
       expect(orgUpdate).toBeDefined();
-
-      // Should update publisher slug
-      const pubUpdate = db._executed.find(
-        (e) => e.sql.includes("UPDATE publishers SET slug"),
-      );
-      expect(pubUpdate).toBeDefined();
 
       // Should update scope
       const scopeUpdate = db._executed.find(
@@ -452,7 +446,7 @@ describe("rename service", () => {
   });
 
   describe("renameUser", () => {
-    it("should cascade to publisher, scope, and personal packages", async () => {
+    it("should cascade to scope and personal packages", async () => {
       const db = createMockDB({
         firstFn: (sql) => {
           if (sql.includes("FROM users")) {
@@ -480,12 +474,6 @@ describe("rename service", () => {
         (e) => e.sql.includes("UPDATE users SET username") && e.sql.includes("renamed_at"),
       );
       expect(userUpdate).toBeDefined();
-
-      // Should update publisher slug
-      const pubUpdate = db._executed.find(
-        (e) => e.sql.includes("UPDATE publishers SET slug"),
-      );
-      expect(pubUpdate).toBeDefined();
 
       // Should update scope
       const scopeUpdate = db._executed.find(
@@ -550,7 +538,7 @@ describe("rename service", () => {
       expect(slugAliases.length).toBeGreaterThanOrEqual(2);
     });
 
-    it("should update publisher with user kind filter", async () => {
+    it("should update scope with user owner_type filter", async () => {
       const db = createMockDB({
         firstFn: (sql) => {
           if (sql.includes("FROM users")) {
@@ -563,10 +551,10 @@ describe("rename service", () => {
 
       await renameUser(db as unknown as D1Database, "user-1", "bob");
 
-      const pubUpdate = db._executed.find(
-        (e) => e.sql.includes("UPDATE publishers SET slug") && e.sql.includes("kind = 'user'"),
+      const scopeUpdate = db._executed.find(
+        (e) => e.sql.includes("UPDATE scopes SET name") && e.sql.includes("owner_type = 'user'"),
       );
-      expect(pubUpdate).toBeDefined();
+      expect(scopeUpdate).toBeDefined();
     });
 
     it("should flatten scope alias chains", async () => {

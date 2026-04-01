@@ -68,12 +68,11 @@ function createPackageListApp(db: MockDB, user?: { id: string }) {
 
     const user = c.get("user");
     if (user) {
-      conditions.push(`(visibility = 'public' OR publisher_id IN (
-        SELECT id FROM publishers WHERE user_id = ? AND kind = 'user'
-        UNION
-        SELECT p.id FROM publishers p
-        JOIN org_members m ON p.org_id = m.org_id
-        WHERE m.user_id = ? AND p.kind = 'org'
+      conditions.push(`(visibility = 'public' OR (
+        (owner_type = 'user' AND owner_id = ?)
+        OR (owner_type = 'org' AND owner_id IN (
+          SELECT org_id FROM org_members WHERE user_id = ?
+        ))
       ))`);
       params.push(user.id, user.id);
     } else {
@@ -101,11 +100,11 @@ function createPackageListApp(db: MockDB, user?: { id: string }) {
 
 describe("packages list — visibility filtering", () => {
   const allPackages = [
-    { id: "1", full_name: "@hong/public-pkg", visibility: "public", publisher_id: "pub-hong", downloads: 100, deleted_at: null },
-    { id: "2", full_name: "@hong/private-pkg", visibility: "private", publisher_id: "pub-hong", downloads: 50, deleted_at: null },
-    { id: "3", full_name: "@hong/unlisted-pkg", visibility: "unlisted", publisher_id: "pub-hong", downloads: 30, deleted_at: null },
-    { id: "4", full_name: "@other/secret", visibility: "private", publisher_id: "pub-other", downloads: 10, deleted_at: null },
-    { id: "5", full_name: "@hong/deleted", visibility: "public", publisher_id: "pub-hong", downloads: 0, deleted_at: "2026-01-01" },
+    { id: "1", full_name: "@hong/public-pkg", visibility: "public", owner_type: "user", owner_id: "user-hong", downloads: 100, deleted_at: null },
+    { id: "2", full_name: "@hong/private-pkg", visibility: "private", owner_type: "user", owner_id: "user-hong", downloads: 50, deleted_at: null },
+    { id: "3", full_name: "@hong/unlisted-pkg", visibility: "unlisted", owner_type: "user", owner_id: "user-hong", downloads: 30, deleted_at: null },
+    { id: "4", full_name: "@other/secret", visibility: "private", owner_type: "user", owner_id: "user-other", downloads: 10, deleted_at: null },
+    { id: "5", full_name: "@hong/deleted", visibility: "public", owner_type: "user", owner_id: "user-hong", downloads: 0, deleted_at: "2026-01-01" },
   ];
 
   function makeDB(userId?: string) {
@@ -116,21 +115,17 @@ describe("packages list — visibility filtering", () => {
           const visible = allPackages.filter(p => {
             if (p.deleted_at) return false;
             if (!userId) return p.visibility === "public";
-            return p.visibility === "public" || p.publisher_id === "pub-hong";
+            return p.visibility === "public" || p.owner_id === "user-hong";
           });
           return { count: visible.length };
         }
         return null;
       },
       allFn: (sql, params) => {
-        if (sql.includes("publishers")) {
-          // getUserPublisherIds subquery
-          return [{ id: "pub-hong" }];
-        }
         const visible = allPackages.filter(p => {
           if (p.deleted_at) return false;
           if (!userId) return p.visibility === "public";
-          return p.visibility === "public" || p.publisher_id === "pub-hong";
+          return p.visibility === "public" || p.owner_id === "user-hong";
         });
         return visible;
       },
@@ -177,15 +172,15 @@ describe("packages list — visibility filtering", () => {
     expect(body.packages.find((p: any) => p.full_name === "@hong/deleted")).toBeUndefined();
   });
 
-  it("authenticated: SQL uses publisher_id IN subquery, not hardcoded public", async () => {
+  it("authenticated: SQL uses owner_type/owner_id subquery, not hardcoded public", async () => {
     const db = makeDB("user-hong");
     const app = createPackageListApp(db, { id: "user-hong" });
 
     await app.request("/v1/packages");
 
-    const listQuery = db._executed.find(e => e.sql.includes("FROM packages") && e.sql.includes("publisher_id"));
+    const listQuery = db._executed.find(e => e.sql.includes("FROM packages") && e.sql.includes("owner_type"));
     expect(listQuery).toBeDefined();
-    expect(listQuery!.sql).toContain("publisher_id IN");
+    expect(listQuery!.sql).toContain("owner_id");
     expect(listQuery!.sql).toContain("deleted_at IS NULL");
     // User ID bound as params
     expect(listQuery!.params).toContain("user-hong");
@@ -252,17 +247,15 @@ function createDeleteApp(overrides?: {
 
 const mockUser = { id: "user-hong", username: "hong", role: "user", github_id: 1, avatar_url: "", created_at: "", updated_at: "" };
 
-/** Standard firstFn for delete tests — handles auth, package, publisher, scope lookups */
+/** Standard firstFn for delete tests — handles auth, package, scope lookups */
 function deleteFirstFn(extra?: (sql: string, params: unknown[]) => unknown | null) {
   return (sql: string, params: unknown[]): unknown | null => {
     // authMiddleware: token → user
     if (sql.includes("api_tokens") && sql.includes("token_hash")) return mockUser;
-    // getPublisherForScope: scope → publisher_id
-    if (sql.includes("publisher_id FROM scopes")) return { publisher_id: "pub-hong" };
-    // getPublisherForScope: publisher by id
-    if (sql.includes("FROM publishers WHERE id")) return { id: "pub-hong", kind: "user", user_id: "user-hong", org_id: null, slug: "hong", created_at: "" };
+    // canPublish → getOwnerForScope: scope → owner
+    if (sql.includes("FROM scopes WHERE name")) return { owner_type: "user", owner_id: "user-hong" };
     // package lookup
-    if (sql.includes("FROM packages WHERE full_name")) return { id: "pkg-1", publisher_id: "pub-hong" };
+    if (sql.includes("FROM packages WHERE full_name")) return { id: "pkg-1", owner_type: "user", owner_id: "user-hong" };
     return extra?.(sql, params) ?? null;
   };
 }

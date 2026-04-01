@@ -125,7 +125,8 @@ async function upsertCandidate(env: Bindings, sourceId: string, candidate: RawCa
   }
 }
 
-const SYSTEM_SCANNER_USER_ID = "system-scanner";
+import { SYSTEM_OWNER_ID } from "../models/types";
+const SYSTEM_SCANNER_USER_ID = SYSTEM_OWNER_ID;
 
 async function autoApprove(env: Bindings) {
   // Auto-approve candidates with confidence > 0.9 and a known license

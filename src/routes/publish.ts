@@ -8,7 +8,7 @@ import { isValidSemVer } from "../utils/semver";
 import { generateId } from "../utils/response";
 import { computeSHA256, extractTypeMetadata, autoDistTag, upsertSearchDigest } from "../services/publish";
 import { enqueueEnrichment } from "../services/enrichment";
-import { getOrCreatePublisher, getPublisherForScope, canPublish, createOrgPublisher } from "../services/publisher";
+import { canPublish, canPublishWithOwner, ensureUserScope, getOwnerForScope, getOwnerSlug } from "../services/ownership";
 import { runStructuralCheck } from "../services/trust";
 import { parse as parseYAML } from "yaml";
 
@@ -86,27 +86,26 @@ app.post("/v1/packages", authMiddleware, async (c) => {
 
   const parsed = parseFullName(name)!;
 
-  // ── Publisher auth (replaces direct owner_id check) ──
-  const personalPublisher = await getOrCreatePublisher(c.env.DB, user.id, user.username);
+  // ── Ownership auth ──
+  await ensureUserScope(c.env.DB, user.id, user.username);
 
   let existingScope = await c.env.DB.prepare(
     "SELECT * FROM scopes WHERE name = ?",
   ).bind(parsed.scope).first();
 
   if (!existingScope) {
-    // Auto-create user scope with publisher
+    // Auto-create user scope
     await c.env.DB.prepare(
-      "INSERT INTO scopes (name, owner_type, owner_id, publisher_id) VALUES (?, 'user', ?, ?)",
-    ).bind(parsed.scope, user.id, personalPublisher.id).run();
-    existingScope = { owner_type: "user", owner_id: user.id, publisher_id: personalPublisher.id };
+      "INSERT INTO scopes (name, owner_type, owner_id) VALUES (?, 'user', ?)",
+    ).bind(parsed.scope, user.id).run();
+    existingScope = { owner_type: "user", owner_id: user.id };
   }
 
-  const publisher = await getPublisherForScope(c.env.DB, parsed.scope);
-  if (!publisher) {
-    throw forbidden(`Scope @${parsed.scope} has no publisher`);
-  }
-  if (!(await canPublish(c.env.DB, user.id, publisher))) {
-    if (publisher.kind === "org") {
+  const scopeOwner = await canPublishWithOwner(c.env.DB, user.id, parsed.scope);
+  if (!scopeOwner) {
+    // Determine error message based on scope owner type
+    const existingOwner = await getOwnerForScope(c.env.DB, parsed.scope);
+    if (existingOwner?.owner_type === "org") {
       throw forbidden(`You are not a member of organization @${parsed.scope}`);
     }
     throw forbidden(`Scope @${parsed.scope} is owned by another user`);
@@ -150,12 +149,12 @@ app.post("/v1/packages", authMiddleware, async (c) => {
   if (!pkg) {
     await c.env.DB.prepare(
       `INSERT INTO packages (id, scope, name, full_name, type, description, keywords, license, summary, capabilities,
-       author, homepage, repository, import_source, import_external_id, owner_id, publisher_id, visibility, mutable, source_repo)
+       author, homepage, repository, import_source, import_external_id, owner_id, owner_type, visibility, mutable, source_repo)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       pkgId, parsed.scope, parsed.name, name, type_, description,
       keywords, license, summary, capabilities, author, homepage, repository,
-      importSource, importExternalId, user.id, publisher.id, visibility, mutable, repository,
+      importSource, importExternalId, scopeOwner.owner_id, scopeOwner.owner_type, visibility, mutable, repository,
     ).run();
   } else {
     // Update metadata on re-publish (including visibility if explicitly changed)
@@ -220,10 +219,11 @@ app.post("/v1/packages", authMiddleware, async (c) => {
 
   // ── Update search digest (public/unlisted only) ──
   if (visibility !== "private") {
+    const ownerSlug = await getOwnerSlug(c.env.DB, scopeOwner);
     await upsertSearchDigest(
       c.env.DB, pkgId, name, type_, description, summary,
       keywords, capabilities, version, (pkg?.downloads as number) ?? 0,
-      publisher.slug,
+      ownerSlug,
     );
   }
 
@@ -265,11 +265,10 @@ app.post("/v1/packages/:fullName/versions/:version/yank", authMiddleware, async 
     throw badRequest("Package not found");
   }
 
-  // Publisher auth for yank
+  // Ownership auth for yank
   const parsed = parseFullName(fullName);
   if (parsed) {
-    const publisher = await getPublisherForScope(c.env.DB, parsed.scope);
-    if (!publisher || !(await canPublish(c.env.DB, user.id, publisher))) {
+    if (!(await canPublish(c.env.DB, user.id, parsed.scope))) {
       throw forbidden("You don't have permission to yank this version");
     }
   } else if (pkg.owner_id !== user.id) {

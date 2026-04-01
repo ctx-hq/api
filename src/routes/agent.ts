@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import type { AppEnv } from "../bindings";
 import { getLatestVersion } from "../services/package";
 import { optionalAuth } from "../middleware/auth";
-import { canAccessPackage } from "../services/publisher";
+import { canAccessPackage } from "../services/ownership";
 
 const app = new Hono<AppEnv>();
 
@@ -13,7 +13,7 @@ app.get("/:fullName{.+\\.ctx$}", optionalAuth, async (c) => {
   const fullName = path.replace(/\.ctx$/, "");
 
   const pkg = await c.env.DB.prepare(
-    "SELECT id, full_name, type, description, license, visibility, publisher_id FROM packages WHERE full_name = ? AND deleted_at IS NULL"
+    "SELECT id, full_name, type, description, license, visibility, owner_type, owner_id FROM packages WHERE full_name = ? AND deleted_at IS NULL"
   ).bind(fullName).first();
 
   if (!pkg) {

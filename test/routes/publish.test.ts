@@ -8,7 +8,6 @@ import publishRoute from "../../src/routes/publish";
 
 function createPublishMockDB(user: { id: string; username: string }) {
   const executed: Array<{ sql: string; params: unknown[] }> = [];
-  const publisherId = "pub-" + user.id;
 
   const db = {
     _executed: executed,
@@ -22,17 +21,9 @@ function createPublishMockDB(user: { id: string; username: string }) {
           if (sql.includes("api_tokens") && sql.includes("token_hash")) {
             return { id: user.id, username: user.username, role: "user", github_id: 1, avatar_url: "", created_at: "" };
           }
-          // getOrCreatePublisher: return existing personal publisher
-          if (sql.includes("FROM publishers") && sql.includes("user_id") && sql.includes("kind = 'user'")) {
-            return { id: publisherId, kind: "user", user_id: user.id, org_id: null, slug: user.username, created_at: "" };
-          }
-          // getPublisherForScope: scope lookup
-          if (sql.includes("publisher_id FROM scopes")) {
-            return { publisher_id: publisherId };
-          }
-          // getPublisherForScope: publisher by id
-          if (sql.includes("FROM publishers WHERE id")) {
-            return { id: publisherId, kind: "user", user_id: user.id, org_id: null, slug: user.username, created_at: "" };
+          // ensureUserScope + getOwnerForScope: scope lookup
+          if (sql.includes("FROM scopes WHERE name")) {
+            return { name: user.username, owner_type: "user", owner_id: user.id };
           }
           // package lookup: not found (new package)
           if (sql.includes("FROM packages")) return null;

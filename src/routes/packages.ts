@@ -1,10 +1,10 @@
 import { Hono } from "hono";
 import type { AppEnv } from "../bindings";
-import type { Visibility, PublisherRow } from "../models/types";
+import type { OwnerType, Visibility } from "../models/types";
 import { notFound, badRequest, forbidden } from "../utils/errors";
 import { getLatestVersion } from "../services/package";
 import { authMiddleware, optionalAuth } from "../middleware/auth";
-import { canPublish, getPublisherForScope, canAccessPackage } from "../services/publisher";
+import { canPublish, canAccessPackage, getOwnerProfile, getOwnerForScope } from "../services/ownership";
 import { parseFullName, isValidScope } from "../utils/naming";
 import { upsertSearchDigest } from "../services/publish";
 import { parseSemVer, compareSemVer } from "../utils/semver";
@@ -25,34 +25,25 @@ app.get("/v1/packages", optionalAuth, async (c) => {
   const params: unknown[] = [];
   const conditions: string[] = ["deleted_at IS NULL"];
 
-  // Visibility: show public to all, plus private/unlisted to authorized publishers
-  // For restricted private packages (with package_access rows), only show to
+  // Visibility: show public to all, plus private/unlisted to authorized owners
+  // For restricted private org packages (with package_access rows), only show to
   // users in the ACL or org owner/admin — not to all org members.
   const user = c.get("user");
   if (user) {
     conditions.push(`(visibility = 'public' OR (
-      publisher_id IN (
-        SELECT id FROM publishers WHERE user_id = ? AND kind = 'user'
-        UNION
-        SELECT p.id FROM publishers p
-        JOIN org_members m ON p.org_id = m.org_id
-        WHERE m.user_id = ? AND p.kind = 'org'
-      )
-      AND (
+      (owner_type = 'user' AND owner_id = ?)
+      OR (owner_type = 'org' AND owner_id IN (
+        SELECT org_id FROM org_members WHERE user_id = ?
+      ) AND (
         visibility != 'private'
         OR NOT EXISTS (SELECT 1 FROM package_access WHERE package_id = packages.id)
         OR EXISTS (SELECT 1 FROM package_access WHERE package_id = packages.id AND user_id = ?)
-        OR publisher_id IN (
-          SELECT p.id FROM publishers p
-          JOIN org_members m ON p.org_id = m.org_id
-          WHERE m.user_id = ? AND m.role IN ('owner', 'admin') AND p.kind = 'org'
+        OR owner_id IN (
+          SELECT org_id FROM org_members WHERE user_id = ? AND role IN ('owner', 'admin')
         )
-        OR publisher_id IN (
-          SELECT id FROM publishers WHERE user_id = ? AND kind = 'user'
-        )
-      )
+      ))
     ))`);
-    params.push(user.id, user.id, user.id, user.id, user.id);
+    params.push(user.id, user.id, user.id, user.id);
   } else {
     conditions.push("visibility = 'public'");
   }
@@ -114,7 +105,7 @@ app.get("/v1/packages/:fullName", optionalAuth, async (c) => {
   const pkg = await c.env.DB.prepare(
     `SELECT id, full_name, type, description, summary, capabilities, license,
             repository, homepage, author, keywords, platforms, downloads,
-            visibility, publisher_id, created_at, updated_at
+            visibility, owner_type, owner_id, created_at, updated_at
      FROM packages WHERE full_name = ? AND deleted_at IS NULL`
   ).bind(fullName).first();
 
@@ -137,14 +128,9 @@ app.get("/v1/packages/:fullName", optionalAuth, async (c) => {
      WHERE pc.package_id = ?`
   ).bind(pkg.id).all();
 
-  // Fetch publisher info (include avatar from users table for user-type publishers)
-  const publisher = pkg.publisher_id
-    ? await c.env.DB.prepare(
-        `SELECT p.slug, p.kind, u.avatar_url
-         FROM publishers p
-         LEFT JOIN users u ON p.user_id = u.id
-         WHERE p.id = ?`
-      ).bind(pkg.publisher_id).first()
+  // Fetch owner info
+  const ownerInfo = pkg.owner_type
+    ? await getOwnerProfile(c.env.DB, pkg.owner_type as OwnerType, pkg.owner_id as string)
     : null;
 
   // Fetch dist-tags
@@ -233,7 +219,7 @@ app.get("/v1/packages/:fullName", optionalAuth, async (c) => {
     categories: (catResult.results ?? []).map((row) => ({ slug: row.slug, name: row.name })),
     downloads: pkg.downloads,
     visibility: pkg.visibility ?? "public",
-    publisher: publisher ? { slug: publisher.slug, kind: publisher.kind, avatar_url: publisher.avatar_url ?? "" } : null,
+    owner: ownerInfo ? { slug: ownerInfo.slug, kind: ownerInfo.kind, avatar_url: ownerInfo.avatar_url } : null,
     dist_tags: distTags,
     versions: versions.results ?? [],
     mcp_detail: mcpDetail,
@@ -249,7 +235,7 @@ app.get("/v1/packages/:fullName/versions", optionalAuth, async (c) => {
   const fullName = decodeURIComponent(c.req.param("fullName")!);
 
   const pkg = await c.env.DB.prepare(
-    "SELECT id, visibility, publisher_id FROM packages WHERE full_name = ? AND deleted_at IS NULL"
+    "SELECT id, visibility, owner_type, owner_id FROM packages WHERE full_name = ? AND deleted_at IS NULL"
   ).bind(fullName).first();
 
   if (!pkg) throw notFound(`Package ${fullName} not found`);
@@ -272,7 +258,7 @@ app.get("/v1/packages/:fullName/versions/:version", optionalAuth, async (c) => {
   const version = c.req.param("version");
 
   const pkg = await c.env.DB.prepare(
-    "SELECT id, visibility, publisher_id FROM packages WHERE full_name = ? AND deleted_at IS NULL"
+    "SELECT id, visibility, owner_type, owner_id FROM packages WHERE full_name = ? AND deleted_at IS NULL"
   ).bind(fullName).first();
 
   if (!pkg) throw notFound(`Package ${fullName} not found`);
@@ -321,16 +307,15 @@ app.patch("/v1/packages/:fullName/visibility", authMiddleware, async (c) => {
   }
 
   const pkg = await c.env.DB.prepare(
-    "SELECT id, full_name, type, description, summary, keywords, capabilities, downloads, publisher_id, visibility, mutable FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+    "SELECT id, full_name, type, description, summary, keywords, capabilities, downloads, owner_type, owner_id, visibility, mutable FROM packages WHERE full_name = ? AND deleted_at IS NULL",
   ).bind(fullName).first();
 
   if (!pkg) throw notFound(`Package ${fullName} not found`);
 
-  // Auth: must be publisher member
+  // Auth: must be scope member
   const parsed = parseFullName(fullName);
   if (!parsed) throw badRequest("Invalid package name");
-  const publisher = await getPublisherForScope(c.env.DB, parsed.scope);
-  if (!publisher || !(await canPublish(c.env.DB, user.id, publisher))) {
+  if (!(await canPublish(c.env.DB, user.id, parsed.scope))) {
     throw forbidden("You don't have permission to change visibility");
   }
 
@@ -348,11 +333,12 @@ app.patch("/v1/packages/:fullName/visibility", authMiddleware, async (c) => {
   if (oldVisibility === "private" && visibility !== "private") {
     // Became visible → create search_digest
     const latestVer = await getLatestVersion(c.env.DB, pkg.id as string);
+    const ownerProfile = await getOwnerProfile(c.env.DB, pkg.owner_type as OwnerType, pkg.owner_id as string);
     await upsertSearchDigest(
       c.env.DB, pkg.id as string, pkg.full_name as string, pkg.type as string,
       pkg.description as string, (pkg.summary as string) ?? "",
       (pkg.keywords as string) ?? "[]", (pkg.capabilities as string) ?? "[]",
-      (latestVer?.version as string) ?? "", pkg.downloads as number, publisher.slug,
+      (latestVer?.version as string) ?? "", pkg.downloads as number, ownerProfile.slug,
     );
   } else if (oldVisibility !== "private" && visibility === "private") {
     // Became private → remove from search
@@ -375,14 +361,13 @@ app.patch("/v1/packages/:fullName/deprecation", authMiddleware, async (c) => {
   }
 
   const pkg = await c.env.DB.prepare(
-    "SELECT id, publisher_id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+    "SELECT id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
   ).bind(fullName).first();
   if (!pkg) throw notFound(`Package ${fullName} not found`);
 
   const parsed = parseFullName(fullName);
   if (!parsed) throw badRequest("Invalid package name");
-  const publisher = await getPublisherForScope(c.env.DB, parsed.scope);
-  if (!publisher || !(await canPublish(c.env.DB, user.id, publisher))) {
+  if (!(await canPublish(c.env.DB, user.id, parsed.scope))) {
     throw forbidden("You don't have permission to deprecate this package");
   }
 
@@ -399,14 +384,13 @@ app.delete("/v1/packages/:fullName", authMiddleware, async (c) => {
   const fullName = decodeURIComponent(c.req.param("fullName")!);
 
   const pkg = await c.env.DB.prepare(
-    "SELECT id, publisher_id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
-  ).bind(fullName).first<{ id: string; publisher_id: string }>();
+    "SELECT id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+  ).bind(fullName).first<{ id: string }>();
   if (!pkg) throw notFound(`Package ${fullName} not found`);
 
   const parsed = parseFullName(fullName);
   if (!parsed) throw badRequest("Invalid package name");
-  const publisher = await getPublisherForScope(c.env.DB, parsed.scope);
-  if (!publisher || !(await canPublish(c.env.DB, user.id, publisher))) {
+  if (!(await canPublish(c.env.DB, user.id, parsed.scope))) {
     throw forbidden("You don't have permission to delete this package");
   }
 
@@ -423,12 +407,6 @@ app.delete("/v1/packages/:fullName", authMiddleware, async (c) => {
   ).bind(pkg.id).all<{ id: string }>();
   const vectorChunkIds = (vectorChunks.results ?? []).map(r => r.id);
 
-  // Hard delete — order matters for FK constraints:
-  // 1. metadata (FK → versions ON DELETE CASCADE, but explicit is safer)
-  // 2. dist_tags (FK → versions without CASCADE — must delete before versions)
-  // 3. versions (FK → packages)
-  // 4. package-level tables
-  // 5. package itself
   const stmts: D1PreparedStatement[] = [];
   for (const vid of versionIds) {
     stmts.push(c.env.DB.prepare("DELETE FROM skill_metadata WHERE version_id = ?").bind(vid));
@@ -474,14 +452,13 @@ app.delete("/v1/packages/:fullName/versions/:version", authMiddleware, async (c)
   const version = c.req.param("version")!;
 
   const pkg = await c.env.DB.prepare(
-    "SELECT id, publisher_id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
-  ).bind(fullName).first<{ id: string; publisher_id: string }>();
+    "SELECT id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+  ).bind(fullName).first<{ id: string }>();
   if (!pkg) throw notFound(`Package ${fullName} not found`);
 
   const parsed = parseFullName(fullName);
   if (!parsed) throw badRequest("Invalid package name");
-  const publisher = await getPublisherForScope(c.env.DB, parsed.scope);
-  if (!publisher || !(await canPublish(c.env.DB, user.id, publisher))) {
+  if (!(await canPublish(c.env.DB, user.id, parsed.scope))) {
     throw forbidden("You don't have permission to delete this version");
   }
 
@@ -545,7 +522,6 @@ app.delete("/v1/packages/:fullName/versions/:version", authMiddleware, async (c)
   ).bind(pkg.id).first();
 
   if (!hasLatest) {
-    // Find highest non-prerelease version by semver (consistent with autoDistTag in publish)
     const stableVersions = await c.env.DB.prepare(
       `SELECT id, version FROM versions WHERE package_id = ? AND version NOT LIKE '%-%'`,
     ).bind(pkg.id).all<{ id: string; version: string }>();
@@ -569,7 +545,7 @@ app.delete("/v1/packages/:fullName/versions/:version", authMiddleware, async (c)
     }
   }
 
-  // Refresh search_digest: if latest exists, update it; otherwise (only prereleases remain), remove it
+  // Refresh search_digest
   const latestVer = await c.env.DB.prepare(
     `SELECT v.version, v.manifest FROM versions v
      JOIN dist_tags dt ON dt.version_id = v.id
@@ -592,7 +568,6 @@ app.delete("/v1/packages/:fullName/versions/:version", authMiddleware, async (c)
       }
     } catch { /* best-effort search_digest refresh */ }
   } else {
-    // No latest tag (only prereleases remain) — remove stale search_digest
     await c.env.DB.prepare("DELETE FROM search_digest WHERE package_id = ?").bind(pkg.id).run();
   }
 
@@ -609,24 +584,23 @@ app.get("/v1/packages/:fullName/access", authMiddleware, async (c) => {
   const fullName = decodeURIComponent(c.req.param("fullName")!);
 
   const pkg = await c.env.DB.prepare(
-    "SELECT id, publisher_id, visibility FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+    "SELECT id, owner_type, owner_id, visibility FROM packages WHERE full_name = ? AND deleted_at IS NULL",
   ).bind(fullName).first();
 
   if (!pkg) throw notFound(`Package ${fullName} not found`);
 
-  // Must be publisher member (owner/admin for org packages)
+  // Must be scope member
   const parsed = parseFullName(fullName);
   if (!parsed) throw badRequest("Invalid package name");
-  const publisher = await getPublisherForScope(c.env.DB, parsed.scope);
-  if (!publisher || !(await canPublish(c.env.DB, user.id, publisher))) {
+  if (!(await canPublish(c.env.DB, user.id, parsed.scope))) {
     throw forbidden("You don't have permission to manage package access");
   }
 
-  // For org publishers, only owner/admin can manage access
-  if (publisher.kind === "org" && publisher.org_id) {
+  // For org-owned packages, only owner/admin can manage access
+  if (pkg.owner_type === "org") {
     const membership = await c.env.DB.prepare(
       "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
-    ).bind(publisher.org_id, user.id).first<{ role: string }>();
+    ).bind(pkg.owner_id, user.id).first<{ role: string }>();
 
     if (!membership || !["owner", "admin"].includes(membership.role)) {
       throw forbidden("Only owners and admins can manage package access");
@@ -654,7 +628,7 @@ app.patch("/v1/packages/:fullName/access", authMiddleware, async (c) => {
   }
 
   const pkg = await c.env.DB.prepare(
-    "SELECT id, publisher_id, visibility FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+    "SELECT id, owner_type, owner_id, visibility FROM packages WHERE full_name = ? AND deleted_at IS NULL",
   ).bind(fullName).first();
 
   if (!pkg) throw notFound(`Package ${fullName} not found`);
@@ -664,17 +638,14 @@ app.patch("/v1/packages/:fullName/access", authMiddleware, async (c) => {
   }
 
   // Must be org owner/admin
-  const parsed = parseFullName(fullName);
-  if (!parsed) throw badRequest("Invalid package name");
-  const publisher = await getPublisherForScope(c.env.DB, parsed.scope);
-
-  if (!publisher || publisher.kind !== "org" || !publisher.org_id) {
+  if (pkg.owner_type !== "org") {
     throw badRequest("Package access control only applies to organization packages");
   }
 
+  const orgId = pkg.owner_id as string;
   const membership = await c.env.DB.prepare(
     "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
-  ).bind(publisher.org_id, user.id).first<{ role: string }>();
+  ).bind(orgId, user.id).first<{ role: string }>();
 
   if (!membership || !["owner", "admin"].includes(membership.role)) {
     throw forbidden("Only owners and admins can manage package access");
@@ -691,7 +662,7 @@ app.patch("/v1/packages/:fullName/access", authMiddleware, async (c) => {
 
       const isMember = await c.env.DB.prepare(
         "SELECT 1 FROM org_members WHERE org_id = ? AND user_id = ?",
-      ).bind(publisher.org_id, targetUser.id).first();
+      ).bind(orgId, targetUser.id).first();
       if (!isMember) throw badRequest(`${username} is not a member of the organization`);
 
       added.push(targetUser.id);
@@ -735,26 +706,24 @@ app.patch("/v1/packages/:fullName/rename", authMiddleware, async (c) => {
   }
 
   const pkg = await c.env.DB.prepare(
-    "SELECT id, publisher_id, scope, name, full_name FROM packages WHERE full_name = ? AND deleted_at IS NULL",
-  ).bind(fullName).first<{ id: string; publisher_id: string; scope: string; name: string; full_name: string }>();
+    "SELECT id, owner_type, owner_id, scope, name, full_name FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+  ).bind(fullName).first<{ id: string; owner_type: string; owner_id: string; scope: string; name: string; full_name: string }>();
 
   if (!pkg) throw notFound(`Package ${fullName} not found`);
 
   // Check permission (must be able to publish to this scope)
-  const publisher = await c.env.DB.prepare(
-    "SELECT * FROM publishers WHERE id = ?",
-  ).bind(pkg.publisher_id).first<PublisherRow>();
+  const parsed = parseFullName(fullName);
+  if (!parsed) throw badRequest("Invalid package name");
 
-  if (!publisher) throw notFound("Publisher not found");
-
-  const hasPermission = await canPublish(c.env.DB, user.id, publisher);
-  if (!hasPermission) throw forbidden("You don't have permission to rename this package");
+  if (!(await canPublish(c.env.DB, user.id, parsed.scope))) {
+    throw forbidden("You don't have permission to rename this package");
+  }
 
   // For org packages, only owner/admin can rename
-  if (publisher.kind === "org" && publisher.org_id) {
+  if (pkg.owner_type === "org") {
     const membership = await c.env.DB.prepare(
       "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
-    ).bind(publisher.org_id, user.id).first<{ role: string }>();
+    ).bind(pkg.owner_id, user.id).first<{ role: string }>();
 
     if (!membership || !["owner", "admin"].includes(membership.role)) {
       throw forbidden("Only org owners and admins can rename packages");

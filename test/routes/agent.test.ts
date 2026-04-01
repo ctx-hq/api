@@ -55,19 +55,19 @@ function createMockDB(overrides?: {
 const publicPkg = {
   id: "pkg-1", full_name: "@hong/public-tool", type: "skill",
   description: "A public tool", license: "MIT",
-  visibility: "public", publisher_id: "pub-hong", deleted_at: null,
+  visibility: "public", owner_type: "user", owner_id: "user-hong", deleted_at: null,
 };
 
 const privatePkg = {
   id: "pkg-2", full_name: "@hong/private-tool", type: "cli",
   description: "A private tool", license: "MIT",
-  visibility: "private", publisher_id: "pub-hong", deleted_at: null,
+  visibility: "private", owner_type: "user", owner_id: "user-hong", deleted_at: null,
 };
 
 const deletedPkg = {
   id: "pkg-3", full_name: "@hong/deleted-tool", type: "skill",
   description: "A deleted tool", license: "MIT",
-  visibility: "public", publisher_id: "pub-hong", deleted_at: "2026-01-15",
+  visibility: "public", owner_type: "user", owner_id: "user-hong", deleted_at: "2026-01-15",
 };
 
 const latestVersion = { version: "1.0.0", manifest: "{}", readme: "Hello" };
@@ -76,7 +76,6 @@ const latestVersion = { version: "1.0.0", manifest: "{}", readme: "Hello" };
 
 function createAgentApp(user?: { id: string }) {
   const packages = [publicPkg, privatePkg, deletedPkg];
-  const publisher = { id: "pub-hong", kind: "user", user_id: "user-hong", org_id: null, slug: "hong" };
 
   const db = createMockDB({
     firstFn: (sql, params) => {
@@ -86,12 +85,6 @@ function createAgentApp(user?: { id: string }) {
         const pkg = packages.find(p => p.full_name === name && !p.deleted_at);
         return pkg ?? null;
       }
-      // canAccessPackage → publisher lookup
-      if (sql.includes("FROM publishers WHERE id")) {
-        return publisher;
-      }
-      // canPublish → org_members (user publisher, check user_id match)
-      if (sql.includes("org_members")) return null;
       // getLatestVersion
       if (sql.includes("versions")) return latestVersion;
       return null;
@@ -111,18 +104,17 @@ function createAgentApp(user?: { id: string }) {
     const fullName = path.replace(/\.ctx$/, "");
 
     const pkg = await c.env.DB.prepare(
-      "SELECT id, full_name, type, description, license, visibility, publisher_id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+      "SELECT id, full_name, type, description, license, visibility, owner_type, owner_id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
     ).bind(fullName).first();
 
     if (!pkg) return c.text(`Package ${fullName} not found`, 404);
 
-    // Visibility guard
+    // Visibility guard — canAccessPackage reads owner_type/owner_id directly, no DB lookup needed
     const u = c.get("user");
     const vis = (pkg as any).visibility;
     if (vis === "private") {
       if (!u) return c.text(`Package ${fullName} not found`, 404);
-      const pub = await c.env.DB.prepare("SELECT * FROM publishers WHERE id = ?").bind((pkg as any).publisher_id).first();
-      if (!pub || (pub as any).user_id !== u.id) {
+      if ((pkg as any).owner_type === "user" && (pkg as any).owner_id !== u.id) {
         return c.text(`Package ${fullName} not found`, 404);
       }
     }
@@ -205,6 +197,7 @@ describe(".ctx agent endpoint — visibility guard", () => {
     const pkgQuery = db._executed.find(e => e.sql.includes("FROM packages WHERE full_name"));
     expect(pkgQuery!.sql).not.toContain("SELECT *");
     expect(pkgQuery!.sql).toContain("visibility");
-    expect(pkgQuery!.sql).toContain("publisher_id");
+    expect(pkgQuery!.sql).toContain("owner_type");
+    expect(pkgQuery!.sql).toContain("owner_id");
   });
 });

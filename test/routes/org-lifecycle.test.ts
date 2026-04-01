@@ -55,7 +55,7 @@ function createMockDB(overrides?: {
 // --- Shared fixtures ---
 
 const mockOrg = { id: "org-acme", name: "acme", status: "active", archived_at: null };
-const mockOrgPublisher = { id: "pub-org-acme", kind: "org", user_id: null, org_id: "org-acme", slug: "acme", created_at: "2026-01-01" };
+const mockOrgScope = { name: "acme", owner_type: "org", owner_id: "org-acme" };
 
 // --- Leave app factory ---
 
@@ -86,18 +86,14 @@ function createLeaveApp(opts?: {
       if (sql.includes("COUNT(*)") && sql.includes("org_members") && sql.includes("owner")) {
         return { count: ownerCount };
       }
-      // Scope lookup (for getPublisherForScope in notification)
+      // Scope lookup (for getOwnerForScope)
       if (sql.includes("FROM scopes WHERE name")) {
-        return { publisher_id: mockOrgPublisher.id };
-      }
-      // Publisher lookup (for notifyPublisherOwners)
-      if (sql.includes("FROM publishers WHERE id")) {
-        return mockOrgPublisher;
+        return mockOrgScope;
       }
       return null;
     },
     allFn: (sql) => {
-      // Org owners (for notifyPublisherOwners)
+      // Org owners (for notifyOwnerOwners)
       if (sql.includes("FROM org_members") && sql.includes("owner")) {
         return [{ user_id: "user-owner-1" }];
       }
@@ -123,8 +119,8 @@ function createLeaveApp(opts?: {
   // --- Leave org (mirrors src/routes/orgs.ts) ---
   app.post("/v1/orgs/:name/leave", async (c) => {
     const { badRequest, notFound } = await import("../../src/utils/errors");
-    const { getPublisherForScope } = await import("../../src/services/publisher");
-    const { notifyPublisherOwners } = await import("../../src/services/notification");
+    const { getOwnerForScope } = await import("../../src/services/ownership");
+    const { notifyOwnerOwners } = await import("../../src/services/notification");
     const { cancelUserInvitations } = await import("../../src/services/invitation");
     const { cleanupUserAccessForOrg } = await import("../../src/services/package-access");
 
@@ -160,10 +156,10 @@ function createLeaveApp(opts?: {
       "DELETE FROM org_members WHERE org_id = ? AND user_id = ?",
     ).bind(org.id, u.id).run();
 
-    const publisher = await getPublisherForScope(c.env.DB as any, name!);
-    if (publisher) {
-      await notifyPublisherOwners(
-        c.env.DB as any, publisher.id, "member_left",
+    const owner = await getOwnerForScope(c.env.DB as any, name!);
+    if (owner) {
+      await notifyOwnerOwners(
+        c.env.DB as any, owner.owner_type, owner.owner_id, "member_left",
         `${u.username} left @${name}`,
         `${u.username} has left the organization`,
         { org_name: name, username: u.username },
@@ -409,7 +405,7 @@ function createOrgRenameApp(opts?: {
 function createDissolveApp(opts?: {
   user?: { id: string; username: string };
   memberRole?: string | null;
-  packages?: Array<{ id: string; name: string; full_name: string; publisher_id: string }>;
+  packages?: Array<{ id: string; name: string; full_name: string; owner_type: string; owner_id: string }>;
 }) {
   const {
     user,
@@ -425,10 +421,7 @@ function createDissolveApp(opts?: {
       if (sql.includes("org_members WHERE org_id") && sql.includes("user_id")) {
         return memberRole ? { role: memberRole } : null;
       }
-      // For canPublish on target publisher (dissolve with transfer_all)
-      if (sql.includes("FROM publishers WHERE slug")) {
-        return { id: "pub-target", kind: "user", user_id: user?.id ?? "user-1", org_id: null, slug: "target" };
-      }
+      // For canPublish on target scope (dissolve with transfer_all)
       if (sql.includes("FROM orgs WHERE id")) {
         return { status: "active" };
       }
@@ -436,9 +429,9 @@ function createDissolveApp(opts?: {
       if (sql.includes("FROM packages WHERE full_name") && sql.includes("deleted_at IS NULL")) {
         return null;
       }
-      // Scope check
+      // Scope check (returns owner info for canPublish)
       if (sql.includes("FROM scopes WHERE name")) {
-        return { name: "target" };
+        return { name: "target", owner_type: "user", owner_id: user?.id ?? "user-1" };
       }
       return null;
     },
@@ -468,7 +461,7 @@ function createDissolveApp(opts?: {
   // --- Dissolve org (mirrors src/routes/orgs.ts) ---
   app.post("/v1/orgs/:name/dissolve", async (c) => {
     const { badRequest, notFound, forbidden, conflict } = await import("../../src/utils/errors");
-    const { canPublish } = await import("../../src/services/publisher");
+    const { canPublish, getOwnerForScope } = await import("../../src/services/ownership");
     const { cancelPackageTransfers } = await import("../../src/services/transfer");
 
     const u = c.get("user");
@@ -498,8 +491,8 @@ function createDissolveApp(opts?: {
     }
 
     const pkgsResult = await c.env.DB.prepare(
-      "SELECT id, name, full_name, publisher_id FROM packages WHERE scope = ? AND deleted_at IS NULL",
-    ).bind(name).all<{ id: string; name: string; full_name: string; publisher_id: string }>();
+      "SELECT id, name, full_name, owner_type, owner_id FROM packages WHERE scope = ? AND deleted_at IS NULL",
+    ).bind(name).all<{ id: string; name: string; full_name: string; owner_type: string; owner_id: string }>();
 
     const pkgs = pkgsResult.results ?? [];
 
@@ -524,14 +517,12 @@ function createDissolveApp(opts?: {
 
       const targetScope = body.transfer_to.startsWith("@") ? body.transfer_to.slice(1) : body.transfer_to;
 
-      const toPublisher = await c.env.DB.prepare(
-        "SELECT * FROM publishers WHERE slug = ?",
-      ).bind(targetScope).first<{ id: string; kind: string; user_id: string | null; org_id: string | null; slug: string }>();
+      const toOwner = await getOwnerForScope(c.env.DB as any, targetScope);
 
-      if (!toPublisher) throw notFound(`Target scope @${targetScope} not found`);
-      if (toPublisher.org_id === org.id) throw badRequest("Cannot transfer packages to the org being dissolved");
+      if (!toOwner) throw notFound(`Target scope @${targetScope} not found`);
+      if (toOwner.owner_type === "org" && toOwner.owner_id === org.id) throw badRequest("Cannot transfer packages to the org being dissolved");
 
-      const callerOwnsTarget = await canPublish(c.env.DB as any, u.id, toPublisher as any);
+      const callerOwnsTarget = await canPublish(c.env.DB as any, u.id, targetScope);
 
       if (!callerOwnsTarget) {
         throw badRequest(
@@ -553,13 +544,13 @@ function createDissolveApp(opts?: {
 
         await c.env.DB.batch([
           c.env.DB.prepare(
-            "UPDATE packages SET scope = ?, full_name = ?, publisher_id = ?, updated_at = datetime('now') WHERE id = ?",
-          ).bind(targetScope, newFullName, toPublisher.id, pkg.id),
+            "UPDATE packages SET scope = ?, full_name = ?, owner_type = ?, owner_id = ?, updated_at = datetime('now') WHERE id = ?",
+          ).bind(targetScope, newFullName, toOwner.owner_type, toOwner.owner_id, pkg.id),
           c.env.DB.prepare(
             "INSERT OR REPLACE INTO slug_aliases (old_full_name, new_full_name) VALUES (?, ?)",
           ).bind(pkg.full_name, newFullName),
           c.env.DB.prepare(
-            "UPDATE search_digest SET full_name = ?, publisher_slug = ?, updated_at = datetime('now') WHERE package_id = ?",
+            "UPDATE search_digest SET full_name = ?, owner_slug = ?, updated_at = datetime('now') WHERE package_id = ?",
           ).bind(newFullName, targetScope, pkg.id),
           c.env.DB.prepare(
             "DELETE FROM package_access WHERE package_id = ?",
@@ -573,7 +564,6 @@ function createDissolveApp(opts?: {
       c.env.DB.prepare("DELETE FROM org_invitations WHERE org_id = ?").bind(org.id),
       c.env.DB.prepare("DELETE FROM org_members WHERE org_id = ?").bind(org.id),
       c.env.DB.prepare("DELETE FROM scopes WHERE name = ?").bind(name),
-      c.env.DB.prepare("DELETE FROM publishers WHERE org_id = ?").bind(org.id),
       c.env.DB.prepare("DELETE FROM orgs WHERE id = ?").bind(org.id),
     ]);
 
@@ -765,7 +755,7 @@ describe("POST /v1/orgs/:name/dissolve — dissolve org", () => {
     const { app, db } = createDissolveApp({
       user: { id: "user-1", username: "alice" },
       packages: [
-        { id: "pkg-1", name: "tool-a", full_name: "@acme/tool-a", publisher_id: "pub-org-acme" },
+        { id: "pkg-1", name: "tool-a", full_name: "@acme/tool-a", owner_type: "org", owner_id: "org-acme" },
       ],
     });
 
@@ -781,7 +771,7 @@ describe("POST /v1/orgs/:name/dissolve — dissolve org", () => {
     expect(body.action).toBe("delete_all");
     expect(body.packages_affected).toBe(1);
 
-    // Verify org cleanup batch (invitations, members, scopes, publishers, org)
+    // Verify org cleanup batch (invitations, members, scopes, org)
     const deleteOrg = db._executed.find(e => e.sql.includes("DELETE FROM orgs WHERE id"));
     expect(deleteOrg).toBeDefined();
     const deleteMembers = db._executed.find(e => e.sql.includes("DELETE FROM org_members WHERE org_id"));

@@ -80,16 +80,20 @@ describe("transfer service", () => {
       const result = await createTransferRequest(
         db as unknown as D1Database,
         "pkg-1",
-        "pub-from",
-        "pub-to",
+        "user",
+        "user-from",
+        "user",
+        "user-to",
         "user-1",
         "Please accept",
       );
 
       expect(result.id).toMatch(/^xfer-/);
       expect(result.package_id).toBe("pkg-1");
-      expect(result.from_publisher_id).toBe("pub-from");
-      expect(result.to_publisher_id).toBe("pub-to");
+      expect(result.from_owner_type).toBe("user");
+      expect(result.from_owner_id).toBe("user-from");
+      expect(result.to_owner_type).toBe("user");
+      expect(result.to_owner_id).toBe("user-to");
       expect(result.initiated_by).toBe("user-1");
       expect(result.status).toBe("pending");
       expect(result.message).toBe("Please accept");
@@ -102,8 +106,10 @@ describe("transfer service", () => {
       const result = await createTransferRequest(
         db as unknown as D1Database,
         "pkg-1",
-        "pub-from",
-        "pub-to",
+        "user",
+        "user-from",
+        "user",
+        "user-to",
         "user-1",
       );
 
@@ -119,17 +125,21 @@ describe("transfer service", () => {
       await createTransferRequest(
         db as unknown as D1Database,
         "pkg-1",
-        "pub-from",
-        "pub-to",
+        "user",
+        "user-from",
+        "org",
+        "org-to",
         "user-1",
       );
 
       const insert = db._executed.find((e) => e.sql.includes("INSERT INTO transfer_requests"));
       expect(insert).toBeDefined();
       expect(insert!.params[1]).toBe("pkg-1");
-      expect(insert!.params[2]).toBe("pub-from");
-      expect(insert!.params[3]).toBe("pub-to");
-      expect(insert!.params[4]).toBe("user-1");
+      expect(insert!.params[2]).toBe("user");
+      expect(insert!.params[3]).toBe("user-from");
+      expect(insert!.params[4]).toBe("org");
+      expect(insert!.params[5]).toBe("org-to");
+      expect(insert!.params[6]).toBe("user-1");
     });
 
     it("should default message to empty string", async () => {
@@ -137,8 +147,10 @@ describe("transfer service", () => {
       const result = await createTransferRequest(
         db as unknown as D1Database,
         "pkg-1",
-        "pub-from",
-        "pub-to",
+        "user",
+        "user-from",
+        "user",
+        "user-to",
         "user-1",
       );
       expect(result.message).toBe("");
@@ -160,8 +172,10 @@ describe("transfer service", () => {
               id: "xfer-1",
               status: "declined",
               package_id: "pkg-1",
-              from_publisher_id: "pub-from",
-              to_publisher_id: "pub-to",
+              from_owner_type: "user",
+              from_owner_id: "user-from",
+              to_owner_type: "user",
+              to_owner_id: "user-to",
               expires_at: new Date(Date.now() + 86400000).toISOString(),
             };
           }
@@ -181,8 +195,10 @@ describe("transfer service", () => {
               id: "xfer-1",
               status: "pending",
               package_id: "pkg-1",
-              from_publisher_id: "pub-from",
-              to_publisher_id: "pub-to",
+              from_owner_type: "user",
+              from_owner_id: "user-from",
+              to_owner_type: "user",
+              to_owner_id: "user-to",
               expires_at: "2020-01-01 00:00:00", // past date
             };
           }
@@ -208,8 +224,10 @@ describe("transfer service", () => {
               id: "xfer-1",
               status: "pending",
               package_id: "pkg-1",
-              from_publisher_id: "pub-from",
-              to_publisher_id: "pub-to",
+              from_owner_type: "user",
+              from_owner_id: "user-from",
+              to_owner_type: "user",
+              to_owner_id: "user-2",
               initiated_by: "user-1",
               message: "",
               expires_at: new Date(Date.now() + 86400000).toISOString(),
@@ -218,8 +236,9 @@ describe("transfer service", () => {
               resolved_by: null,
             };
           }
-          if (sql.includes("FROM publishers")) {
-            return { id: "pub-to", kind: "user", user_id: "user-2", org_id: null, slug: "bob" };
+          // getOwnerSlug queries users table for user owner
+          if (sql.includes("FROM users WHERE id")) {
+            return { username: "bob" };
           }
           if (sql.includes("FROM packages") && sql.includes("full_name = ?")) {
             return null; // no collision
@@ -251,8 +270,10 @@ describe("transfer service", () => {
               id: "xfer-1",
               status: "pending",
               package_id: "pkg-1",
-              from_publisher_id: "pub-from",
-              to_publisher_id: "pub-to",
+              from_owner_type: "user",
+              from_owner_id: "user-from",
+              to_owner_type: "user",
+              to_owner_id: "user-2",
               initiated_by: "user-1",
               message: "",
               expires_at: new Date(Date.now() + 86400000).toISOString(),
@@ -261,8 +282,9 @@ describe("transfer service", () => {
               resolved_by: null,
             };
           }
-          if (sql.includes("FROM publishers")) {
-            return { id: "pub-to", kind: "user", user_id: "user-2", org_id: null, slug: "bob" };
+          // getOwnerSlug queries users table for user owner
+          if (sql.includes("FROM users WHERE id")) {
+            return { username: "bob" };
           }
           if (sql.includes("FROM packages") && sql.includes("full_name = ?")) {
             return null; // no collision
@@ -312,8 +334,10 @@ describe("transfer service", () => {
               id: "xfer-1",
               status: "pending",
               package_id: "pkg-1",
-              from_publisher_id: "pub-from",
-              to_publisher_id: "pub-to",
+              from_owner_type: "user",
+              from_owner_id: "user-from",
+              to_owner_type: "user",
+              to_owner_id: "user-2",
               initiated_by: "user-1",
               message: "",
               expires_at: new Date(Date.now() + 86400000).toISOString(),
@@ -322,8 +346,9 @@ describe("transfer service", () => {
               resolved_by: null,
             };
           }
-          if (sql.includes("FROM publishers")) {
-            return { id: "pub-to", kind: "user", user_id: "user-2", org_id: null, slug: "newuser" };
+          // getOwnerSlug queries users table for user owner
+          if (sql.includes("FROM users WHERE id")) {
+            return { username: "newuser" };
           }
           if (sql.includes("FROM packages") && sql.includes("full_name = ?")) {
             return null; // no collision
@@ -402,7 +427,7 @@ describe("transfer service", () => {
       expect(expireQuery).toBeDefined();
     });
 
-    it("should query with user-based join for user publishers and org owners", async () => {
+    it("should query with owner-based conditions for user and org targets", async () => {
       const db = createMockDB();
       await listIncomingTransfers(db as unknown as D1Database, "user-1");
 
@@ -410,7 +435,8 @@ describe("transfer service", () => {
         (e) => e.sql.includes("SELECT t.*") && e.sql.includes("transfer_requests"),
       );
       expect(selectQuery).toBeDefined();
-      expect(selectQuery!.sql).toContain("tp.user_id = ?");
+      expect(selectQuery!.sql).toContain("to_owner_type");
+      expect(selectQuery!.sql).toContain("to_owner_id");
       expect(selectQuery!.sql).toContain("org_members");
       expect(selectQuery!.params[0]).toBe("user-1");
       expect(selectQuery!.params[1]).toBe("user-1");
@@ -422,7 +448,7 @@ describe("transfer service", () => {
       expect(result).toEqual([]);
     });
 
-    it("should return transfers with package and publisher info", async () => {
+    it("should return transfers with package and owner info", async () => {
       const db = createMockDB({
         allFn: (sql) => {
           if (sql.includes("transfer_requests") && sql.includes("SELECT t.*")) {
@@ -430,8 +456,10 @@ describe("transfer service", () => {
               {
                 id: "xfer-1",
                 package_id: "pkg-1",
-                from_publisher_id: "pub-1",
-                to_publisher_id: "pub-2",
+                from_owner_type: "user",
+                from_owner_id: "user-1",
+                to_owner_type: "user",
+                to_owner_id: "user-2",
                 status: "pending",
                 package_name: "@alice/tool",
                 from_slug: "alice",

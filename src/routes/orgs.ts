@@ -4,14 +4,13 @@ import { authMiddleware, optionalAuth } from "../middleware/auth";
 import { badRequest, notFound, forbidden, conflict } from "../utils/errors";
 import { isValidScope } from "../utils/naming";
 import { generateId } from "../utils/response";
-import { createOrgPublisher, getPublisherForScope, canPublish, isMemberOfPublisher } from "../services/publisher";
+import { canPublish, getOwnerForScope, isMemberOfOwner } from "../services/ownership";
 import type { InvitationStatus } from "../models/types";
 import { renameOrg } from "../services/rename";
 import { checkRenameCooldown, isNameAvailable } from "../services/rename";
 import { cancelPackageTransfers } from "../services/transfer";
 import { flattenPackageAliasChains } from "../services/redirect";
-import type { PublisherRow } from "../models/types";
-import { notify, notifyPublisherOwners } from "../services/notification";
+import { notify, notifyOwnerOwners } from "../services/notification";
 import {
   createInvitation,
   listOrgInvitations,
@@ -51,18 +50,14 @@ app.post("/v1/orgs", authMiddleware, async (c) => {
 
   const orgId = generateId();
 
-  // Create org first (publishers.org_id has FK to orgs.id)
   await c.env.DB.prepare(
     "INSERT INTO orgs (id, name, display_name, created_by) VALUES (?, ?, ?, ?)",
   ).bind(orgId, body.name, body.display_name ?? body.name, user.id).run();
 
-  // Now create publisher (FK to orgs.id is satisfied)
-  const publisher = await createOrgPublisher(c.env.DB, orgId, body.name);
-
   await c.env.DB.batch([
     c.env.DB.prepare(
-      "INSERT INTO scopes (name, owner_type, owner_id, publisher_id) VALUES (?, 'org', ?, ?)",
-    ).bind(body.name, orgId, publisher.id),
+      "INSERT INTO scopes (name, owner_type, owner_id) VALUES (?, 'org', ?)",
+    ).bind(body.name, orgId),
     c.env.DB.prepare(
       "INSERT INTO org_members (org_id, user_id, role) VALUES (?, ?, 'owner')",
     ).bind(orgId, user.id),
@@ -86,8 +81,8 @@ app.get("/v1/orgs/:name", optionalAuth, async (c) => {
 
   // Package count: respect package_access restrictions for non-owner/admin members
   const user = c.get("user");
-  const publisher = await getPublisherForScope(c.env.DB, name!);
-  const isMember = user && publisher ? await isMemberOfPublisher(c.env.DB, user.id, publisher) : false;
+  const scopeOwner = await getOwnerForScope(c.env.DB, name!);
+  const isMember = user && scopeOwner ? await isMemberOfOwner(c.env.DB, user.id, scopeOwner) : false;
 
   let packageCount: Record<string, unknown> | null;
   if (!isMember) {
@@ -271,8 +266,8 @@ app.get("/v1/orgs/:name/packages", optionalAuth, async (c) => {
   // Restricted private packages (with package_access rows) are hidden from
   // regular members unless they have an explicit grant.
   const user = c.get("user");
-  const publisher = await getPublisherForScope(c.env.DB, name!);
-  const isMember = user && publisher ? await isMemberOfPublisher(c.env.DB, user.id, publisher) : false;
+  const scopeOwner = await getOwnerForScope(c.env.DB, name!);
+  const isMember = user && scopeOwner ? await isMemberOfOwner(c.env.DB, user.id, scopeOwner) : false;
 
   const conditions: string[] = ["scope = ?", "deleted_at IS NULL"];
   const params: unknown[] = [name];
@@ -360,14 +355,11 @@ app.delete("/v1/orgs/:name", authMiddleware, async (c) => {
     c.env.DB.prepare("DELETE FROM org_invitations WHERE org_id = ?").bind(org.id),
     c.env.DB.prepare(
       `DELETE FROM package_access WHERE package_id IN (
-         SELECT id FROM packages WHERE publisher_id IN (
-           SELECT id FROM publishers WHERE org_id = ?
-         )
+         SELECT id FROM packages WHERE owner_type = 'org' AND owner_id = ?
        )`,
     ).bind(org.id),
     c.env.DB.prepare("DELETE FROM org_members WHERE org_id = ?").bind(org.id),
     c.env.DB.prepare("DELETE FROM scopes WHERE name = ?").bind(name),
-    c.env.DB.prepare("DELETE FROM publishers WHERE org_id = ?").bind(org.id),
     c.env.DB.prepare("DELETE FROM orgs WHERE id = ?").bind(org.id),
   ]);
 
@@ -598,11 +590,12 @@ app.post("/v1/me/invitations/:id/accept", authMiddleware, async (c) => {
     .first<{ name: string }>();
 
   // Notify org owners that a new member joined
-  const publisher = await getPublisherForScope(c.env.DB, org?.name ?? "");
-  if (publisher) {
-    await notifyPublisherOwners(
+  const scopeOwner = await getOwnerForScope(c.env.DB, org?.name ?? "");
+  if (scopeOwner) {
+    await notifyOwnerOwners(
       c.env.DB,
-      publisher.id,
+      scopeOwner.owner_type,
+      scopeOwner.owner_id,
       "member_joined",
       `${user.username} joined @${org?.name}`,
       `${user.username} accepted the invitation and joined as ${result.role}`,
@@ -723,11 +716,12 @@ app.post("/v1/orgs/:name/leave", authMiddleware, async (c) => {
   ).bind(org.id, user.id).run();
 
   // Notify org owners
-  const publisher = await getPublisherForScope(c.env.DB, name!);
-  if (publisher) {
-    await notifyPublisherOwners(
+  const leaveOwner = await getOwnerForScope(c.env.DB, name!);
+  if (leaveOwner) {
+    await notifyOwnerOwners(
       c.env.DB,
-      publisher.id,
+      leaveOwner.owner_type,
+      leaveOwner.owner_id,
       "member_left",
       `${user.username} left @${name}`,
       `${user.username} has left the organization`,
@@ -884,8 +878,8 @@ app.post("/v1/orgs/:name/dissolve", authMiddleware, async (c) => {
 
   // Get all packages
   const packages = await c.env.DB.prepare(
-    "SELECT id, name, full_name, publisher_id FROM packages WHERE scope = ? AND deleted_at IS NULL",
-  ).bind(name).all<{ id: string; name: string; full_name: string; publisher_id: string }>();
+    "SELECT id, name, full_name FROM packages WHERE scope = ? AND deleted_at IS NULL",
+  ).bind(name).all<{ id: string; name: string; full_name: string }>();
 
   const pkgs = packages.results ?? [];
 
@@ -896,16 +890,15 @@ app.post("/v1/orgs/:name/dissolve", authMiddleware, async (c) => {
 
     const targetScope = body.transfer_to.startsWith("@") ? body.transfer_to.slice(1) : body.transfer_to;
 
-    // Find target publisher
-    const toPublisher = await c.env.DB.prepare(
-      "SELECT * FROM publishers WHERE slug = ?",
-    ).bind(targetScope).first<PublisherRow>();
-
-    if (!toPublisher) throw notFound(`Target scope @${targetScope} not found`);
-    if (toPublisher.org_id === org.id) throw badRequest("Cannot transfer packages to the org being dissolved");
+    // Find target scope owner
+    const toOwner = await getOwnerForScope(c.env.DB, targetScope);
+    if (!toOwner) throw notFound(`Target scope @${targetScope} not found`);
+    if (toOwner.owner_type === "org" && toOwner.owner_id === (org.id as string)) {
+      throw badRequest("Cannot transfer packages to the org being dissolved");
+    }
 
     // Check if caller is also owner of target scope (auto-accept) or create transfer requests
-    const callerOwnsTarget = await canPublish(c.env.DB, user.id, toPublisher);
+    const callerOwnsTarget = await canPublish(c.env.DB, user.id, targetScope);
 
     if (callerOwnsTarget) {
       // Auto-accept: directly move all packages
@@ -929,12 +922,11 @@ app.post("/v1/orgs/:name/dissolve", authMiddleware, async (c) => {
 
       if (!existingScope) {
         await c.env.DB.prepare(
-          "INSERT INTO scopes (name, owner_type, owner_id, publisher_id) VALUES (?, ?, ?, ?)",
+          "INSERT INTO scopes (name, owner_type, owner_id) VALUES (?, ?, ?)",
         ).bind(
           targetScope,
-          toPublisher.kind === "user" ? "user" : "org",
-          toPublisher.kind === "user" ? toPublisher.user_id : toPublisher.org_id,
-          toPublisher.id,
+          toOwner.owner_type,
+          toOwner.owner_id,
         ).run();
       }
 
@@ -950,13 +942,13 @@ app.post("/v1/orgs/:name/dissolve", authMiddleware, async (c) => {
 
         stmts.push(
           c.env.DB.prepare(
-            "UPDATE packages SET scope = ?, full_name = ?, publisher_id = ?, updated_at = datetime('now') WHERE id = ?",
-          ).bind(targetScope, newFullName, toPublisher.id, pkg.id),
+            "UPDATE packages SET scope = ?, full_name = ?, owner_type = ?, owner_id = ?, updated_at = datetime('now') WHERE id = ?",
+          ).bind(targetScope, newFullName, toOwner.owner_type, toOwner.owner_id, pkg.id),
           c.env.DB.prepare(
             "INSERT OR REPLACE INTO slug_aliases (old_full_name, new_full_name) VALUES (?, ?)",
           ).bind(pkg.full_name, newFullName),
           c.env.DB.prepare(
-            "UPDATE search_digest SET full_name = ?, publisher_slug = ?, updated_at = datetime('now') WHERE package_id = ?",
+            "UPDATE search_digest SET full_name = ?, owner_slug = ?, updated_at = datetime('now') WHERE package_id = ?",
           ).bind(newFullName, targetScope, pkg.id),
           c.env.DB.prepare(
             "DELETE FROM package_access WHERE package_id = ?",
@@ -1010,7 +1002,6 @@ app.post("/v1/orgs/:name/dissolve", authMiddleware, async (c) => {
     c.env.DB.prepare("DELETE FROM org_invitations WHERE org_id = ?").bind(org.id),
     c.env.DB.prepare("DELETE FROM org_members WHERE org_id = ?").bind(org.id),
     c.env.DB.prepare("DELETE FROM scopes WHERE name = ?").bind(name),
-    c.env.DB.prepare("DELETE FROM publishers WHERE org_id = ?").bind(org.id),
     c.env.DB.prepare("DELETE FROM orgs WHERE id = ?").bind(org.id),
   ]);
 

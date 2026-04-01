@@ -1,5 +1,6 @@
-import type { PublisherRow, TransferStatus, TransferRequestRow } from "../models/types";
+import type { OwnerType, TransferStatus, TransferRequestRow } from "../models/types";
 import { generateId } from "../utils/response";
+import { getOwnerSlug } from "./ownership";
 
 export type { TransferStatus, TransferRequestRow };
 
@@ -17,8 +18,10 @@ function toSqliteDatetime(d: Date): string {
 export async function createTransferRequest(
   db: D1Database,
   packageId: string,
-  fromPublisherId: string,
-  toPublisherId: string,
+  fromOwnerType: OwnerType,
+  fromOwnerId: string,
+  toOwnerType: OwnerType,
+  toOwnerId: string,
   initiatedBy: string,
   message = "",
 ): Promise<TransferRequestRow> {
@@ -31,17 +34,19 @@ export async function createTransferRequest(
   await db
     .prepare(
       `INSERT INTO transfer_requests
-       (id, package_id, from_publisher_id, to_publisher_id, initiated_by, status, message, expires_at, created_at)
-       VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+       (id, package_id, from_owner_type, from_owner_id, to_owner_type, to_owner_id, initiated_by, status, message, expires_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
     )
-    .bind(id, packageId, fromPublisherId, toPublisherId, initiatedBy, message, expiresAt, now)
+    .bind(id, packageId, fromOwnerType, fromOwnerId, toOwnerType, toOwnerId, initiatedBy, message, expiresAt, now)
     .run();
 
   return {
     id,
     package_id: packageId,
-    from_publisher_id: fromPublisherId,
-    to_publisher_id: toPublisherId,
+    from_owner_type: fromOwnerType,
+    from_owner_id: fromOwnerId,
+    to_owner_type: toOwnerType,
+    to_owner_id: toOwnerId,
     initiated_by: initiatedBy,
     status: "pending",
     message,
@@ -82,14 +87,10 @@ export async function acceptTransfer(
 
   // --- Validate preconditions BEFORE marking accepted ---
 
-  // Get target publisher to determine new scope
-  const toPublisher = await db
-    .prepare("SELECT * FROM publishers WHERE id = ?")
-    .bind(transfer.to_publisher_id)
-    .first<PublisherRow>();
-
-  if (!toPublisher) {
-    throw new Error("Target publisher no longer exists");
+  // Get target scope slug from owner
+  const newScope = await getOwnerSlug(db, { owner_type: transfer.to_owner_type, owner_id: transfer.to_owner_id });
+  if (newScope === "unknown") {
+    throw new Error("Target owner no longer exists");
   }
 
   // Get the package
@@ -102,7 +103,6 @@ export async function acceptTransfer(
     throw new Error("Package no longer exists or has been deleted");
   }
 
-  const newScope = toPublisher.slug;
   const newFullName = `@${newScope}/${pkg.name}`;
   const oldFullName = pkg.full_name;
 
@@ -125,13 +125,12 @@ export async function acceptTransfer(
   if (!existingScope) {
     await db
       .prepare(
-        "INSERT INTO scopes (name, owner_type, owner_id, publisher_id) VALUES (?, ?, ?, ?)",
+        "INSERT INTO scopes (name, owner_type, owner_id) VALUES (?, ?, ?)",
       )
       .bind(
         newScope,
-        toPublisher.kind === "user" ? "user" : "org",
-        toPublisher.kind === "user" ? toPublisher.user_id : toPublisher.org_id,
-        toPublisher.id,
+        transfer.to_owner_type,
+        transfer.to_owner_id,
       )
       .run();
   }
@@ -139,8 +138,6 @@ export async function acceptTransfer(
   const now = toSqliteDatetime(new Date());
 
   // Atomic batch: mark accepted AND move the package in one batch
-  // If the conditional update finds 0 rows (race), the package move still runs
-  // but is harmless — the package stays where it is. We check changes below.
   const batchResults = await db.batch([
     // Conditional UPDATE: only succeeds if still pending (prevents double-accept race)
     db.prepare(
@@ -149,8 +146,8 @@ export async function acceptTransfer(
 
     // Move the package
     db.prepare(
-      "UPDATE packages SET scope = ?, full_name = ?, publisher_id = ?, updated_at = datetime('now') WHERE id = ? AND full_name = ?",
-    ).bind(newScope, newFullName, toPublisher.id, pkg.id, oldFullName),
+      "UPDATE packages SET scope = ?, full_name = ?, owner_type = ?, owner_id = ?, updated_at = datetime('now') WHERE id = ? AND full_name = ?",
+    ).bind(newScope, newFullName, transfer.to_owner_type, transfer.to_owner_id, pkg.id, oldFullName),
 
     // Create slug alias for old name
     db.prepare(
@@ -159,7 +156,7 @@ export async function acceptTransfer(
 
     // Update search_digest
     db.prepare(
-      "UPDATE search_digest SET full_name = ?, publisher_slug = ?, updated_at = datetime('now') WHERE package_id = ?",
+      "UPDATE search_digest SET full_name = ?, owner_slug = ?, updated_at = datetime('now') WHERE package_id = ?",
     ).bind(newFullName, newScope, pkg.id),
 
     // Clean up package_access (org-specific, meaningless after transfer)
@@ -198,7 +195,7 @@ export async function declineTransfer(
 }
 
 /**
- * Cancel a pending transfer (by the initiator or source publisher owner).
+ * Cancel a pending transfer (by the initiator or source owner).
  */
 export async function cancelTransfer(
   db: D1Database,
@@ -216,8 +213,9 @@ export async function cancelTransfer(
 }
 
 /**
- * List incoming transfer requests for publishers the user owns.
+ * List incoming transfer requests for the user.
  * Auto-expires past-due transfers before returning.
+ * Uses CASE expressions to resolve from_slug/to_slug from owners directly.
  */
 export async function listIncomingTransfers(
   db: D1Database,
@@ -228,19 +226,27 @@ export async function listIncomingTransfers(
 
   const result = await db
     .prepare(
-      `SELECT t.*, p.full_name AS package_name, fp.slug AS from_slug, tp.slug AS to_slug
+      `SELECT t.*, p.full_name AS package_name,
+         CASE t.from_owner_type
+           WHEN 'user' THEN (SELECT username FROM users WHERE id = t.from_owner_id)
+           WHEN 'org' THEN (SELECT name FROM orgs WHERE id = t.from_owner_id)
+           ELSE 'system'
+         END AS from_slug,
+         CASE t.to_owner_type
+           WHEN 'user' THEN (SELECT username FROM users WHERE id = t.to_owner_id)
+           WHEN 'org' THEN (SELECT name FROM orgs WHERE id = t.to_owner_id)
+           ELSE 'system'
+         END AS to_slug
        FROM transfer_requests t
        JOIN packages p ON t.package_id = p.id
-       JOIN publishers fp ON t.from_publisher_id = fp.id
-       JOIN publishers tp ON t.to_publisher_id = tp.id
        WHERE t.status = 'pending'
          AND (
-           -- User is the target publisher (user kind)
-           tp.user_id = ?
-           -- Or user is owner of target org
-           OR tp.org_id IN (
+           -- User is the target owner (user kind)
+           (t.to_owner_type = 'user' AND t.to_owner_id = ?)
+           -- Or user is owner/admin of target org
+           OR (t.to_owner_type = 'org' AND t.to_owner_id IN (
              SELECT org_id FROM org_members WHERE user_id = ? AND role IN ('owner', 'admin')
-           )
+           ))
          )
        ORDER BY t.created_at DESC`,
     )

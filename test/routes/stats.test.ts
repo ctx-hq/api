@@ -88,7 +88,7 @@ describe("stats routes", () => {
           if (sql.includes("SUM(ds.count)") && sql.includes("download_stats")) {
             return { total: 1500 };
           }
-          if (sql.includes("COUNT(DISTINCT publisher_id)")) {
+          if (sql.includes("COUNT(DISTINCT owner_id)")) {
             return { count: 7 };
           }
           return null;
@@ -110,7 +110,7 @@ describe("stats routes", () => {
       const body = await res.json() as any;
       expect(body.total_packages).toBe(42);
       expect(body.total_downloads).toBe(1500);
-      expect(body.total_publishers).toBe(7);
+      expect(body.total_owners).toBe(7);
       expect(body.breakdown).toHaveLength(2);
       expect(body.breakdown[0]).toEqual({
         type: "skill",
@@ -124,7 +124,7 @@ describe("stats routes", () => {
         firstFn: (sql) => {
           if (sql.includes("COUNT(*)")) return { count: 1 };
           if (sql.includes("download_stats")) return { total: 999 };
-          if (sql.includes("COUNT(DISTINCT publisher_id)")) return { count: 1 };
+          if (sql.includes("COUNT(DISTINCT owner_id)")) return { count: 1 };
           return null;
         },
         allFn: () => [],
@@ -140,14 +140,14 @@ describe("stats routes", () => {
       expect(downloadQuery?.sql).not.toContain("SUM(downloads)");
     });
 
-    it("should exclude empty publisher_id from count", async () => {
+    it("should exclude system owners from owner count", async () => {
       const { request, db } = createStatsApp({
         firstFn: (sql) => {
-          if (sql.includes("COUNT(*)")) return { count: 5 };
+          if (sql.includes("COUNT(*)") && !sql.includes("DISTINCT")) return { count: 5 };
           if (sql.includes("download_stats")) return { total: 0 };
-          if (sql.includes("COUNT(DISTINCT publisher_id)")) {
-            // Verify the SQL excludes empty publisher_id
-            expect(sql).toContain("publisher_id != ''");
+          if (sql.includes("COUNT(DISTINCT owner_id)")) {
+            // Verify the SQL excludes system owner_type
+            expect(sql).toContain("owner_type != 'system'");
             return { count: 3 };
           }
           return null;
@@ -157,7 +157,7 @@ describe("stats routes", () => {
 
       const res = await request("/v1/stats/overview");
       const body = await res.json() as any;
-      expect(body.total_publishers).toBe(3);
+      expect(body.total_owners).toBe(3);
     });
 
     it("should return zeros for empty registry", async () => {
@@ -172,7 +172,7 @@ describe("stats routes", () => {
       const body = await res.json() as any;
       expect(body.total_packages).toBe(0);
       expect(body.total_downloads).toBe(0);
-      expect(body.total_publishers).toBe(0);
+      expect(body.total_owners).toBe(0);
       expect(body.breakdown).toHaveLength(0);
     });
 
@@ -181,7 +181,7 @@ describe("stats routes", () => {
         firstFn: (sql) => {
           if (sql.includes("COUNT(*)")) return { count: 0 };
           if (sql.includes("download_stats")) return { total: 0 };
-          if (sql.includes("COUNT(DISTINCT publisher_id)")) return { count: 0 };
+          if (sql.includes("COUNT(DISTINCT owner_id)")) return { count: 0 };
           return null;
         },
         allFn: (sql) => {

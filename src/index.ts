@@ -19,11 +19,12 @@ import versions from "./routes/versions";
 import categories from "./routes/categories";
 import tags from "./routes/tags";
 import stats from "./routes/stats";
-import publishers from "./routes/publishers";
+import profiles from "./routes/profiles";
 import sync from "./routes/sync";
 import transfers from "./routes/transfers";
 import notifications from "./routes/notifications";
 import mcp from "./routes/mcp";
+import claims from "./routes/claims";
 import { resolvePackageName } from "./services/redirect";
 import { cleanupOldNotifications } from "./services/notification";
 
@@ -97,11 +98,12 @@ app.route("/", versions);
 app.route("/", categories);
 app.route("/", tags);
 app.route("/", stats);
-app.route("/", publishers);
+app.route("/", profiles);
 app.route("/", sync);
 app.route("/", transfers);
 app.route("/", notifications);
 app.route("/", mcp);
+app.route("/", claims);
 app.route("/", root);
 
 // 404 handler — consistent JSON format for unmatched routes

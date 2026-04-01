@@ -3,7 +3,7 @@ import type { AppEnv } from "../bindings";
 import { notFound } from "../utils/errors";
 import { generateId } from "../utils/response";
 import { optionalAuth } from "../middleware/auth";
-import { canAccessPackage } from "../services/publisher";
+import { canAccessPackage } from "../services/ownership";
 
 const app = new Hono<AppEnv>();
 
@@ -13,7 +13,7 @@ app.get("/v1/packages/:fullName/versions/:version/archive", optionalAuth, async 
   const version = c.req.param("version")!;
 
   const pkg = await c.env.DB.prepare(
-    "SELECT id, visibility, publisher_id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+    "SELECT id, visibility, owner_type, owner_id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
   ).bind(fullName).first();
 
   if (!pkg) throw notFound(`Package ${fullName} not found`);
