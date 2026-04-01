@@ -137,9 +137,14 @@ app.get("/v1/packages/:fullName", optionalAuth, async (c) => {
      WHERE pc.package_id = ?`
   ).bind(pkg.id).all();
 
-  // Fetch publisher info
+  // Fetch publisher info (include avatar from users table for user-type publishers)
   const publisher = pkg.publisher_id
-    ? await c.env.DB.prepare("SELECT slug, kind FROM publishers WHERE id = ?").bind(pkg.publisher_id).first()
+    ? await c.env.DB.prepare(
+        `SELECT p.slug, p.kind, u.avatar_url
+         FROM publishers p
+         LEFT JOIN users u ON p.user_id = u.id
+         WHERE p.id = ?`
+      ).bind(pkg.publisher_id).first()
     : null;
 
   // Fetch dist-tags
@@ -228,7 +233,7 @@ app.get("/v1/packages/:fullName", optionalAuth, async (c) => {
     categories: (catResult.results ?? []).map((row) => ({ slug: row.slug, name: row.name })),
     downloads: pkg.downloads,
     visibility: pkg.visibility ?? "public",
-    publisher: publisher ? { slug: publisher.slug, kind: publisher.kind } : null,
+    publisher: publisher ? { slug: publisher.slug, kind: publisher.kind, avatar_url: publisher.avatar_url ?? "" } : null,
     dist_tags: distTags,
     versions: versions.results ?? [],
     mcp_detail: mcpDetail,
