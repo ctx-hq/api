@@ -210,7 +210,7 @@ app.post("/v1/packages", authMiddleware, async (c) => {
   }
 
   // ── Extract type-specific metadata ──
-  await extractTypeMetadata(c.env.DB, versionId, manifest);
+  const metaResult = await extractTypeMetadata(c.env.DB, versionId, manifest);
 
   // ── Auto dist-tag ──
   const distTags = await autoDistTag(c.env.DB, pkgId, versionId, version);
@@ -246,7 +246,8 @@ app.post("/v1/packages", authMiddleware, async (c) => {
     visibility,
     trust_tier: "structural",
     tags: distTags,
-    url: `https://getctx.org/${name}`,
+    url: `https://getctx.org/package/${name}`,
+    ...(metaResult.unresolved_members?.length ? { unresolved_members: metaResult.unresolved_members } : {}),
   }, 201);
 });
 

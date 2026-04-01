@@ -215,7 +215,7 @@ describe("publish route — metadata write-through", () => {
     }));
 
     expect(res.status).toBe(201);
-    const body = await res.json();
+    const body = (await res.json()) as { full_name: string };
     expect(body.full_name).toBe("@hong/fizzy-cli");
 
     // Verify cli_metadata INSERT includes auth column and value

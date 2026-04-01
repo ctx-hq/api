@@ -273,6 +273,53 @@ app.get("/v1/me", authMiddleware, async (c) => {
   });
 });
 
+// Update user profile (bio, website)
+app.patch("/v1/me/profile", authMiddleware, async (c) => {
+  const user = c.get("user");
+  let body: { bio?: string; website?: string };
+  try {
+    body = await c.req.json();
+  } catch {
+    throw badRequest("Invalid JSON body");
+  }
+
+  const updates: string[] = [];
+  const params: unknown[] = [];
+
+  if (typeof body.bio === "string") {
+    if (body.bio.length > 256) {
+      throw badRequest("Bio must be 256 characters or less");
+    }
+    updates.push("bio = ?");
+    params.push(body.bio.trim());
+  }
+
+  if (typeof body.website === "string") {
+    const site = body.website.trim();
+    if (site.length > 2048) {
+      throw badRequest("Website must be 2048 characters or less");
+    }
+    if (site && !site.startsWith("https://") && !site.startsWith("http://")) {
+      throw badRequest("Website must be a valid URL (https://) or empty");
+    }
+    updates.push("website = ?");
+    params.push(site);
+  }
+
+  if (updates.length === 0) {
+    throw badRequest("No fields to update");
+  }
+
+  updates.push("updated_at = datetime('now')");
+  params.push(user.id);
+
+  await c.env.DB.prepare(
+    `UPDATE users SET ${updates.join(", ")} WHERE id = ?`,
+  ).bind(...params).run();
+
+  return c.json({ ok: true });
+});
+
 // --- Token Management ---
 
 // List current user's tokens

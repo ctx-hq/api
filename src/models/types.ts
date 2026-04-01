@@ -1,6 +1,6 @@
 // Shared types for the ctx registry API
 
-export type PackageType = "skill" | "mcp" | "cli";
+export type PackageType = "skill" | "mcp" | "cli" | "collection";
 
 export type EnrichmentStatus = "pending" | "queued" | "enriched" | "failed";
 
@@ -259,4 +259,28 @@ export interface ScannerCandidateRow {
   stars: number;
   license: string;
   last_checked: string;
+}
+
+// Collection membership
+export interface CollectionMemberRow {
+  id: string;
+  collection_id: string;
+  member_id: string;
+  member_path: string;
+  display_order: number;
+  created_at: string;
+}
+
+// Source sync tracking for scanner-imported packages
+export interface SourceSyncRow {
+  id: string;
+  package_id: string;
+  github_repo: string;
+  path: string;
+  ref: string;
+  last_commit: string;
+  last_synced: string | null;
+  sync_errors: number;
+  enabled: number;
+  created_at: string;
 }

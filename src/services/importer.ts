@@ -150,9 +150,94 @@ export async function importHomebrewPopular(cursor: string): Promise<RawCandidat
   });
 }
 
+// GitHub monorepo scanner — finds repos with multiple SKILL.md files in subdirs.
+// Limited to 5 repos per invocation to stay within GitHub API rate limits.
+export async function importGitHubMonorepos(_sourceKey: string, cursor: string): Promise<RawCandidate[]> {
+  const page = cursor ? parseInt(cursor) : 1;
+
+  // Search for repos that have marketplace.json (strong signal for skill collections)
+  // or multiple SKILL.md files via code search.
+  const resp = await fetch(
+    `${GITHUB_API}/search/code?q=filename:marketplace.json+path:.claude-plugin&per_page=20&page=${page}`,
+    { headers: githubHeaders() }
+  );
+
+  if (!resp.ok) return [];
+
+  // Check remaining rate limit before proceeding with per-repo calls
+  const remaining = parseInt(resp.headers.get("X-RateLimit-Remaining") ?? "100");
+  if (remaining < 10) return [];
+
+  const data = await resp.json() as { items: GitHubCodeResult[] };
+
+  const candidates: RawCandidate[] = [];
+  const seenRepos = new Set<string>();
+  const MAX_REPOS = 5;
+  let repoCount = 0;
+
+  for (const item of data.items ?? []) {
+    if (repoCount >= MAX_REPOS) break;
+
+    const repoName = item.repository.full_name;
+    if (seenRepos.has(repoName)) continue;
+    seenRepos.add(repoName);
+    repoCount++;
+
+    // Fetch repo info to get default branch, then tree in parallel where possible
+    const repoResp = await fetch(
+      `${GITHUB_API}/repos/${repoName}`,
+      { headers: githubHeaders() }
+    );
+    if (!repoResp.ok) continue;
+    const repoInfo = await repoResp.json() as { default_branch: string };
+    const defaultBranch = repoInfo.default_branch ?? "main";
+
+    const treeResp = await fetch(
+      `${GITHUB_API}/repos/${repoName}/git/trees/${defaultBranch}?recursive=1`,
+      { headers: githubHeaders() }
+    );
+    if (!treeResp.ok) continue;
+    const tree = await treeResp.json() as { tree: { path: string; type: string }[] };
+
+    const skillPaths = (tree.tree ?? [])
+      .filter(t => t.type === "blob" && t.path.endsWith("/SKILL.md"))
+      .map(t => t.path);
+
+    if (skillPaths.length < 2) continue; // Not a monorepo
+
+    // Generate one candidate per skill
+    for (const skillPath of skillPaths) {
+      const dir = skillPath.replace(/\/SKILL\.md$/, "");
+      const skillName = sanitizeName(dir.split("/").pop() ?? "");
+      if (!skillName) continue;
+
+      candidates.push({
+        external_id: `github:${repoName}:${dir}`,
+        external_url: `${item.repository.html_url}/tree/${defaultBranch}/${dir}`,
+        detected_type: "skill" as const,
+        detected_name: skillName,
+        generated_manifest: JSON.stringify({
+          name: `@community/${skillName}`,
+          version: "0.0.1",
+          type: "skill",
+          description: item.repository.description ?? `Skill from ${repoName}/${dir}`,
+          repository: item.repository.html_url,
+          skill: { entry: "SKILL.md" },
+          source: { github: repoName, path: dir, ref: defaultBranch },
+        }),
+        confidence: 0.80,
+        stars: item.repository.stargazers_count ?? 0,
+        license: "",
+      });
+    }
+  }
+
+  return candidates;
+}
+
 // Helpers
 
-function githubHeaders(): Record<string, string> {
+export function githubHeaders(): Record<string, string> {
   const headers: Record<string, string> = {
     Accept: "application/vnd.github.v3+json",
     "User-Agent": "ctx-scanner/0.1",

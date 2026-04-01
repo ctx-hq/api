@@ -20,18 +20,35 @@ app.get("/v1/publishers/:slug", optionalAuth, async (c) => {
     ? "publisher_id = ? AND deleted_at IS NULL"
     : "publisher_id = ? AND visibility = 'public' AND deleted_at IS NULL";
 
-  const packageCount = await c.env.DB.prepare(
-    `SELECT COUNT(*) as count FROM packages WHERE ${countWhere}`,
-  )
-    .bind(publisher.id)
-    .first<{ count: number }>();
+  const [packageCount, downloadSum, profileInfo] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT COUNT(*) as count FROM packages WHERE ${countWhere}`,
+    ).bind(publisher.id).first<{ count: number }>(),
+    c.env.DB.prepare(
+      `SELECT COALESCE(SUM(downloads), 0) as total FROM packages WHERE ${countWhere}`,
+    ).bind(publisher.id).first<{ total: number }>(),
+    publisher.kind === "user" && publisher.user_id
+      ? c.env.DB.prepare(
+          "SELECT avatar_url, bio, website FROM users WHERE id = ?",
+        ).bind(publisher.user_id).first<{ avatar_url: string; bio: string; website: string }>()
+      : Promise.resolve(null),
+  ]);
 
-  return c.json({
+  const response: Record<string, unknown> = {
     slug: publisher.slug,
     kind: publisher.kind,
     packages: packageCount?.count ?? 0,
+    total_downloads: downloadSum?.total ?? 0,
     created_at: publisher.created_at,
-  });
+  };
+
+  if (profileInfo) {
+    response.avatar_url = profileInfo.avatar_url ?? "";
+    response.bio = profileInfo.bio ?? "";
+    response.website = profileInfo.website ?? "";
+  }
+
+  return c.json(response);
 });
 
 // List publisher's packages

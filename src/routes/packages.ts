@@ -177,6 +177,42 @@ app.get("/v1/packages/:fullName", optionalAuth, async (c) => {
     }
   }
 
+  // Fetch collection-related data (mutually exclusive by type)
+  let collectionMembers: { full_name: string; type: string; description: string; version: string }[] | null = null;
+  let partOfCollections: { full_name: string; description: string }[] | null = null;
+
+  if (pkg.type === "collection") {
+    const membersResult = await c.env.DB.prepare(
+      `SELECT p.id, p.full_name, p.type, p.description,
+              (SELECT v.version FROM versions v WHERE v.package_id = p.id ORDER BY v.created_at DESC LIMIT 1) AS latest_version
+       FROM collection_members cm
+       JOIN packages p ON cm.member_id = p.id
+       WHERE cm.collection_id = ? AND p.deleted_at IS NULL
+       ORDER BY cm.display_order`
+    ).bind(pkg.id).all();
+
+    collectionMembers = (membersResult.results ?? []).map((row: Record<string, unknown>) => ({
+      full_name: row.full_name as string,
+      type: row.type as string,
+      description: row.description as string,
+      version: (row.latest_version as string) ?? "",
+    }));
+  } else {
+    const collectionsResult = await c.env.DB.prepare(
+      `SELECT p.full_name, p.description
+       FROM collection_members cm
+       JOIN packages p ON cm.collection_id = p.id
+       WHERE cm.member_id = ? AND p.deleted_at IS NULL`
+    ).bind(pkg.id).all();
+    const rows = collectionsResult.results ?? [];
+    partOfCollections = rows.length > 0
+      ? rows.map((row: Record<string, unknown>) => ({
+          full_name: row.full_name as string,
+          description: row.description as string,
+        }))
+      : null;
+  }
+
   return c.json({
     full_name: pkg.full_name,
     type: pkg.type,
@@ -196,6 +232,8 @@ app.get("/v1/packages/:fullName", optionalAuth, async (c) => {
     dist_tags: distTags,
     versions: versions.results ?? [],
     mcp_detail: mcpDetail,
+    collection_members: collectionMembers,
+    part_of_collections: partOfCollections,
     created_at: pkg.created_at,
     updated_at: pkg.updated_at,
   });

@@ -1,6 +1,7 @@
 import type { Bindings } from "../bindings";
 import { generateId } from "../utils/response";
-import { importGitHubTopics, importGitHubSkills, importMCPRegistry, importHomebrewPopular } from "./importer";
+import { importGitHubTopics, importGitHubSkills, importGitHubMonorepos, importMCPRegistry, importHomebrewPopular } from "./importer";
+import { upsertSourceSync } from "./source-sync";
 
 export interface ScannerSource {
   id: string;
@@ -32,6 +33,7 @@ const DEFAULT_SOURCES = [
   { type: "github_topic", source_key: "github:topic:claude-skill" },
   { type: "github_topic", source_key: "github:topic:llm-tool" },
   { type: "github_search", source_key: "github:file:SKILL.md" },
+  { type: "github_monorepo", source_key: "github:monorepo:skill-collection" },
   { type: "mcp_registry", source_key: "mcp:registry:official" },
   { type: "homebrew", source_key: "brew:popular:cli" },
 ];
@@ -82,6 +84,8 @@ async function scanSource(env: Bindings, source: ScannerSource): Promise<RawCand
       return importGitHubSkills(source.source_key, source.cursor_state);
     case "mcp_registry":
       return importMCPRegistry(source.cursor_state);
+    case "github_monorepo":
+      return importGitHubMonorepos(source.source_key, source.cursor_state);
     case "homebrew":
       return importHomebrewPopular(source.cursor_state);
     default:
@@ -185,6 +189,12 @@ async function importAsPackage(env: Bindings, candidate: ScannerCandidate, owner
     `INSERT INTO versions (id, package_id, version, manifest, published_by)
      VALUES (?, ?, ?, ?, ?)`
   ).bind(generateId(), pkgId, version, candidate.generated_manifest, ownerId).run();
+
+  // Set up source sync tracking if manifest has source info
+  const source = manifest.source as { github?: string; path?: string; ref?: string } | undefined;
+  if (source?.github) {
+    await upsertSourceSync(env.DB, pkgId, source.github, source.path ?? "", source.ref ?? "main");
+  }
 }
 
 async function seedSources(env: Bindings) {

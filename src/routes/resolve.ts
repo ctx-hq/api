@@ -72,12 +72,26 @@ app.post("/v1/resolve", optionalAuth, async (c) => {
         ? `https://api.getctx.org/v1/packages/${encodeURIComponent(fullName)}/versions/${matched.version}/archive`
         : "";
 
-      resolved[fullName] = {
+      const entry: Record<string, unknown> = {
         version: matched.version,
         manifest: matched.manifest,
         download_url: downloadUrl,
         sha256: matched.sha256,
       };
+
+      // For collection packages, include member list for client-side expansion
+      if (matched.manifest) {
+        try {
+          const parsedManifest = typeof matched.manifest === "string" ? JSON.parse(matched.manifest) : matched.manifest;
+          if (parsedManifest?.type === "collection" && parsedManifest?.collection?.members) {
+            entry.collection_members = parsedManifest.collection.members;
+          }
+        } catch {
+          // Malformed manifest JSON — skip collection expansion
+        }
+      }
+
+      resolved[fullName] = entry;
     }
   }
 
