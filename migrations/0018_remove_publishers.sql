@@ -30,28 +30,58 @@ ALTER TABLE packages DROP COLUMN publisher_id;
 ALTER TABLE scopes DROP COLUMN publisher_id;
 
 -- ============================================================
--- TRANSFER REQUESTS: Add owner-typed columns, backfill, drop publisher columns
+-- TRANSFER REQUESTS: Rebuild table to replace publisher FK columns
+-- with owner_type/owner_id columns (SQLite can't DROP FK columns)
 -- ============================================================
-ALTER TABLE transfer_requests ADD COLUMN from_owner_type TEXT NOT NULL DEFAULT 'user';
-ALTER TABLE transfer_requests ADD COLUMN from_owner_id TEXT NOT NULL DEFAULT '';
-ALTER TABLE transfer_requests ADD COLUMN to_owner_type TEXT NOT NULL DEFAULT 'user';
-ALTER TABLE transfer_requests ADD COLUMN to_owner_id TEXT NOT NULL DEFAULT '';
 
--- Backfill from publishers
-UPDATE transfer_requests SET
-    from_owner_type = (SELECT CASE p.kind WHEN 'org' THEN 'org' ELSE 'user' END FROM publishers p WHERE p.id = transfer_requests.from_publisher_id),
-    from_owner_id = (SELECT COALESCE(p.user_id, p.org_id) FROM publishers p WHERE p.id = transfer_requests.from_publisher_id),
-    to_owner_type = (SELECT CASE p.kind WHEN 'org' THEN 'org' ELSE 'user' END FROM publishers p WHERE p.id = transfer_requests.to_publisher_id),
-    to_owner_id = (SELECT COALESCE(p.user_id, p.org_id) FROM publishers p WHERE p.id = transfer_requests.to_publisher_id)
-WHERE from_publisher_id != '';
+-- Step 1: Create new table without publisher FKs
+CREATE TABLE transfer_requests_new (
+    id              TEXT PRIMARY KEY,
+    package_id      TEXT NOT NULL,
+    from_owner_type TEXT NOT NULL DEFAULT 'user',
+    from_owner_id   TEXT NOT NULL DEFAULT '',
+    to_owner_type   TEXT NOT NULL DEFAULT 'user',
+    to_owner_id     TEXT NOT NULL DEFAULT '',
+    initiated_by    TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'accepted', 'declined', 'expired', 'cancelled')),
+    message         TEXT NOT NULL DEFAULT '',
+    expires_at      TEXT NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    resolved_at     TEXT,
+    resolved_by     TEXT,
+    FOREIGN KEY (package_id) REFERENCES packages(id),
+    FOREIGN KEY (initiated_by) REFERENCES users(id),
+    FOREIGN KEY (resolved_by) REFERENCES users(id)
+);
 
-CREATE INDEX idx_transfer_to_owner ON transfer_requests(to_owner_type, to_owner_id, status);
+-- Step 2: Migrate data with backfill from publishers
+INSERT INTO transfer_requests_new (
+    id, package_id,
+    from_owner_type, from_owner_id,
+    to_owner_type, to_owner_id,
+    initiated_by, status, message, expires_at, created_at, resolved_at, resolved_by
+)
+SELECT
+    t.id, t.package_id,
+    COALESCE((SELECT CASE p.kind WHEN 'org' THEN 'org' ELSE 'user' END FROM publishers p WHERE p.id = t.from_publisher_id), 'user'),
+    COALESCE((SELECT COALESCE(p.user_id, p.org_id) FROM publishers p WHERE p.id = t.from_publisher_id), ''),
+    COALESCE((SELECT CASE p.kind WHEN 'org' THEN 'org' ELSE 'user' END FROM publishers p WHERE p.id = t.to_publisher_id), 'user'),
+    COALESCE((SELECT COALESCE(p.user_id, p.org_id) FROM publishers p WHERE p.id = t.to_publisher_id), ''),
+    t.initiated_by, t.status, t.message, t.expires_at, t.created_at, t.resolved_at, t.resolved_by
+FROM transfer_requests t;
 
--- Drop old publisher columns and indexes
+-- Step 3: Swap tables
+DROP INDEX IF EXISTS idx_transfer_pending;
 DROP INDEX IF EXISTS idx_transfer_to_status;
 DROP INDEX IF EXISTS idx_transfer_from;
-ALTER TABLE transfer_requests DROP COLUMN from_publisher_id;
-ALTER TABLE transfer_requests DROP COLUMN to_publisher_id;
+DROP TABLE transfer_requests;
+ALTER TABLE transfer_requests_new RENAME TO transfer_requests;
+
+-- Step 4: Recreate indexes
+CREATE UNIQUE INDEX idx_transfer_pending ON transfer_requests(package_id)
+    WHERE status = 'pending';
+CREATE INDEX idx_transfer_to_owner ON transfer_requests(to_owner_type, to_owner_id, status);
 
 -- ============================================================
 -- SEARCH DIGEST: Add owner_slug, backfill, drop publisher_slug
@@ -79,7 +109,7 @@ CREATE INDEX idx_claims_package ON package_claims(package_id);
 CREATE INDEX idx_claims_claimant ON package_claims(claimant_id);
 
 -- ============================================================
--- DROP publishers table (all references removed)
+-- DROP publishers table (all FK references removed above)
 -- ============================================================
 DROP INDEX IF EXISTS idx_publishers_user;
 DROP INDEX IF EXISTS idx_publishers_org;

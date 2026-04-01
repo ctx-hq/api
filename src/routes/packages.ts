@@ -270,7 +270,7 @@ app.get("/v1/packages/:fullName/versions/:version", optionalAuth, async (c) => {
 
   const ver = await c.env.DB.prepare(
     `SELECT v.version, v.manifest, v.readme, v.sha256, v.yanked, v.created_at,
-            u.username AS publisher
+            u.username AS published_by_username
      FROM versions v
      LEFT JOIN users u ON v.published_by = u.id
      WHERE v.package_id = ? AND v.version = ?`
@@ -284,7 +284,7 @@ app.get("/v1/packages/:fullName/versions/:version", optionalAuth, async (c) => {
     readme: ver.readme,
     sha256: ver.sha256,
     yanked: ver.yanked === 1,
-    published_by: (ver.publisher as string) ?? "[unknown]",
+    published_by: (ver.published_by_username as string) ?? "[unknown]",
     created_at: ver.created_at,
   });
 });

@@ -471,13 +471,13 @@ describe("packages privacy", () => {
     const expectedSqlPattern = /LEFT JOIN users u ON v\.published_by = u\.id/;
     const routeSource = `
       SELECT v.version, v.manifest, v.readme, v.sha256, v.yanked, v.created_at,
-             u.username AS publisher
+             u.username AS published_by_username
       FROM versions v
       LEFT JOIN users u ON v.published_by = u.id
       WHERE v.package_id = ? AND v.version = ?
     `;
     expect(routeSource).toMatch(expectedSqlPattern);
-    expect(routeSource).toContain("publisher");
+    expect(routeSource).toContain("published_by_username");
     expect(routeSource).not.toMatch(/SELECT \* FROM versions/);
   });
 
