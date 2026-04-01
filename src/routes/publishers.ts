@@ -84,7 +84,8 @@ app.get("/v1/publishers/:slug/packages", optionalAuth, async (c) => {
       .first<{ count: number }>(),
     c.env.DB.prepare(
       `SELECT p.full_name, p.type, p.description, p.summary, p.downloads,
-              p.visibility, p.created_at, p.updated_at
+              p.visibility, p.created_at, p.updated_at,
+              (SELECT v.version FROM versions v WHERE v.package_id = p.id ORDER BY v.created_at DESC LIMIT 1) AS version
        FROM packages p WHERE ${baseWhere}
        ORDER BY p.downloads DESC LIMIT ? OFFSET ?`,
     )

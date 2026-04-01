@@ -131,7 +131,8 @@ app.get("/v1/stats/trending", async (c) => {
 
   const trending = await c.env.DB.prepare(
     `SELECT ds.package_id, SUM(ds.count) as weekly_downloads,
-            p.full_name, p.type, p.description
+            p.full_name, p.type, p.description, p.downloads,
+            (SELECT v.version FROM versions v WHERE v.package_id = p.id ORDER BY v.created_at DESC LIMIT 1) AS version
      FROM download_stats ds
      JOIN packages p ON ds.package_id = p.id
      WHERE ds.date >= date('now', '-7 days')
