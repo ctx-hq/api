@@ -360,6 +360,79 @@ export async function upsertSearchDigest(
     .run();
 }
 
+/**
+ * Sync keywords from manifest to normalized keywords + package_keywords tables.
+ * Idempotent: deletes old mappings, inserts new ones, recalculates usage_count.
+ */
+export async function syncKeywords(
+  db: D1Database,
+  packageId: string,
+  keywords: string[],
+): Promise<void> {
+  // Normalize keywords
+  const slugs = keywords
+    .map((k) => k.trim().toLowerCase().replace(/[^a-z0-9-]/g, ""))
+    .filter((s) => s.length > 0);
+
+  if (slugs.length === 0) return;
+
+  // Batch upsert keywords
+  const upsertStmts = slugs.map((slug) =>
+    db.prepare(
+      "INSERT OR IGNORE INTO keywords (id, slug, usage_count) VALUES (?, ?, 0)"
+    ).bind(generateId(), slug),
+  );
+  await db.batch(upsertStmts);
+
+  // Get affected keyword IDs (old) for usage_count recalculation
+  const oldKeywords = await db.prepare(
+    "SELECT keyword_id FROM package_keywords WHERE package_id = ?"
+  ).bind(packageId).all();
+  const oldKeywordIds = (oldKeywords.results ?? []).map((r) => r.keyword_id as string);
+
+  // Delete old package_keywords entries
+  await db.prepare(
+    "DELETE FROM package_keywords WHERE package_id = ?"
+  ).bind(packageId).run();
+
+  // Look up new keyword IDs
+  const placeholders = slugs.map(() => "?").join(",");
+  const keywordRows = await db.prepare(
+    `SELECT id, slug FROM keywords WHERE slug IN (${placeholders})`
+  ).bind(...slugs).all();
+
+  const slugToId = new Map<string, string>();
+  for (const row of keywordRows.results ?? []) {
+    slugToId.set(row.slug as string, row.id as string);
+  }
+
+  // Batch insert new package_keywords
+  const insertStmts = slugs
+    .map((slug) => {
+      const kwId = slugToId.get(slug);
+      if (!kwId) return null;
+      return db.prepare(
+        "INSERT OR IGNORE INTO package_keywords (package_id, keyword_id) VALUES (?, ?)"
+      ).bind(packageId, kwId);
+    })
+    .filter((s): s is D1PreparedStatement => s !== null);
+
+  if (insertStmts.length > 0) {
+    await db.batch(insertStmts);
+  }
+
+  // Batch recalculate usage_count for all affected keywords
+  const allKeywordIds = new Set([...oldKeywordIds, ...[...slugToId.values()]]);
+  const countStmts = [...allKeywordIds].map((kwId) =>
+    db.prepare(
+      "UPDATE keywords SET usage_count = (SELECT COUNT(*) FROM package_keywords WHERE keyword_id = ?) WHERE id = ?"
+    ).bind(kwId, kwId),
+  );
+  if (countStmts.length > 0) {
+    await db.batch(countStmts);
+  }
+}
+
 export async function computeSHA256(text: string): Promise<string> {
   const data = new TextEncoder().encode(text);
   const hash = await crypto.subtle.digest("SHA-256", data);

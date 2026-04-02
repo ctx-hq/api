@@ -16,5 +16,10 @@ export type AppEnv = {
   Bindings: Bindings;
   Variables: {
     user: UserRow;
+    tokenScopes: {
+      endpoints: string[];
+      packages: string[];
+      tokenType: string;
+    };
   };
 };

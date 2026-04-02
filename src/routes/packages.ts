@@ -3,8 +3,8 @@ import type { AppEnv } from "../bindings";
 import type { OwnerType, Visibility } from "../models/types";
 import { notFound, badRequest, forbidden } from "../utils/errors";
 import { getLatestVersion } from "../services/package";
-import { authMiddleware, optionalAuth } from "../middleware/auth";
-import { canPublish, canAccessPackage, getOwnerProfile, getOwnerForScope } from "../services/ownership";
+import { authMiddleware, optionalAuth, requireScope, tokenCanActOnPackage } from "../middleware/auth";
+import { canPublish, canManage, canAdmin, canAccessPackage, getOwnerProfile, getOwnerForScope } from "../services/ownership";
 import { parseFullName, isValidScope } from "../utils/naming";
 import { upsertSearchDigest } from "../services/publish";
 import { parseSemVer, compareSemVer } from "../utils/semver";
@@ -104,7 +104,7 @@ app.get("/v1/packages/:fullName", optionalAuth, async (c) => {
 
   const pkg = await c.env.DB.prepare(
     `SELECT id, full_name, type, description, summary, capabilities, license,
-            repository, homepage, author, keywords, platforms, downloads,
+            repository, homepage, author, keywords, platforms, downloads, star_count,
             visibility, owner_type, owner_id, created_at, updated_at
      FROM packages WHERE full_name = ? AND deleted_at IS NULL`
   ).bind(fullName).first();
@@ -204,6 +204,15 @@ app.get("/v1/packages/:fullName", optionalAuth, async (c) => {
       : null;
   }
 
+  // Check if current user has starred this package
+  let isStarred = false;
+  if (user) {
+    const starRow = await c.env.DB.prepare(
+      "SELECT 1 FROM stars WHERE user_id = ? AND package_id = ?"
+    ).bind(user.id, pkg.id).first();
+    isStarred = !!starRow;
+  }
+
   return c.json({
     full_name: pkg.full_name,
     type: pkg.type,
@@ -218,6 +227,8 @@ app.get("/v1/packages/:fullName", optionalAuth, async (c) => {
     platforms: JSON.parse((pkg.platforms as string) ?? "[]"),
     categories: (catResult.results ?? []).map((row) => ({ slug: row.slug, name: row.name })),
     downloads: pkg.downloads,
+    star_count: (pkg.star_count as number) ?? 0,
+    is_starred: isStarred,
     visibility: pkg.visibility ?? "public",
     owner: ownerInfo ? { slug: ownerInfo.slug, kind: ownerInfo.kind, avatar_url: ownerInfo.avatar_url } : null,
     dist_tags: distTags,
@@ -290,9 +301,13 @@ app.get("/v1/packages/:fullName/versions/:version", optionalAuth, async (c) => {
 });
 
 // Change package visibility
-app.patch("/v1/packages/:fullName/visibility", authMiddleware, async (c) => {
+app.patch("/v1/packages/:fullName/visibility", authMiddleware, requireScope("manage-access"), async (c) => {
   const user = c.get("user");
   const fullName = decodeURIComponent(c.req.param("fullName")!);
+
+  if (!tokenCanActOnPackage(c, fullName)) {
+    throw forbidden(`Token does not have permission to act on package ${fullName}`);
+  }
 
   let body: { visibility: string };
   try {
@@ -312,11 +327,11 @@ app.patch("/v1/packages/:fullName/visibility", authMiddleware, async (c) => {
 
   if (!pkg) throw notFound(`Package ${fullName} not found`);
 
-  // Auth: must be scope member
+  // Auth: must be owner/admin for org packages (canManage)
   const parsed = parseFullName(fullName);
   if (!parsed) throw badRequest("Invalid package name");
-  if (!(await canPublish(c.env.DB, user.id, parsed.scope))) {
-    throw forbidden("You don't have permission to change visibility");
+  if (!(await canManage(c.env.DB, user.id, parsed.scope))) {
+    throw forbidden("Only org owners and admins can change visibility");
   }
 
   // Mutable constraint: mutable only allowed for private
@@ -348,10 +363,14 @@ app.patch("/v1/packages/:fullName/visibility", authMiddleware, async (c) => {
   return c.json({ full_name: fullName, visibility });
 });
 
-// Deprecate a package
-app.patch("/v1/packages/:fullName/deprecation", authMiddleware, async (c) => {
+// Deprecate a package (requires admin+ for org packages)
+app.patch("/v1/packages/:fullName/deprecation", authMiddleware, requireScope("manage-access"), async (c) => {
   const user = c.get("user");
   const fullName = decodeURIComponent(c.req.param("fullName")!);
+
+  if (!tokenCanActOnPackage(c, fullName)) {
+    throw forbidden(`Token does not have permission to act on package ${fullName}`);
+  }
 
   let body: { message: string };
   try {
@@ -367,8 +386,8 @@ app.patch("/v1/packages/:fullName/deprecation", authMiddleware, async (c) => {
 
   const parsed = parseFullName(fullName);
   if (!parsed) throw badRequest("Invalid package name");
-  if (!(await canPublish(c.env.DB, user.id, parsed.scope))) {
-    throw forbidden("You don't have permission to deprecate this package");
+  if (!(await canManage(c.env.DB, user.id, parsed.scope))) {
+    throw forbidden("Only org owners and admins can deprecate packages");
   }
 
   await c.env.DB.prepare(
@@ -378,10 +397,14 @@ app.patch("/v1/packages/:fullName/deprecation", authMiddleware, async (c) => {
   return c.json({ full_name: fullName, deprecated: true, message: body.message });
 });
 
-// Delete a package (hard delete — removes all versions, metadata, and archives)
-app.delete("/v1/packages/:fullName", authMiddleware, async (c) => {
+// Delete a package (hard delete — requires admin+ for org packages)
+app.delete("/v1/packages/:fullName", authMiddleware, requireScope("manage-access"), async (c) => {
   const user = c.get("user");
   const fullName = decodeURIComponent(c.req.param("fullName")!);
+
+  if (!tokenCanActOnPackage(c, fullName)) {
+    throw forbidden(`Token does not have permission to act on package ${fullName}`);
+  }
 
   const pkg = await c.env.DB.prepare(
     "SELECT id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
@@ -390,8 +413,8 @@ app.delete("/v1/packages/:fullName", authMiddleware, async (c) => {
 
   const parsed = parseFullName(fullName);
   if (!parsed) throw badRequest("Invalid package name");
-  if (!(await canPublish(c.env.DB, user.id, parsed.scope))) {
-    throw forbidden("You don't have permission to delete this package");
+  if (!(await canManage(c.env.DB, user.id, parsed.scope))) {
+    throw forbidden("Only org owners and admins can delete packages");
   }
 
   // Collect R2 keys and vector chunk IDs for cleanup
@@ -445,11 +468,15 @@ app.delete("/v1/packages/:fullName", authMiddleware, async (c) => {
   return c.json({ full_name: fullName, deleted: true, versions_removed: versionIds.length });
 });
 
-// Delete a single version (hard delete — removes version, metadata, and archive)
-app.delete("/v1/packages/:fullName/versions/:version", authMiddleware, async (c) => {
+// Delete a single version (hard delete — requires admin+ for org packages)
+app.delete("/v1/packages/:fullName/versions/:version", authMiddleware, requireScope("manage-access"), async (c) => {
   const user = c.get("user");
   const fullName = decodeURIComponent(c.req.param("fullName")!);
   const version = c.req.param("version")!;
+
+  if (!tokenCanActOnPackage(c, fullName)) {
+    throw forbidden(`Token does not have permission to act on package ${fullName}`);
+  }
 
   const pkg = await c.env.DB.prepare(
     "SELECT id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
@@ -458,8 +485,8 @@ app.delete("/v1/packages/:fullName/versions/:version", authMiddleware, async (c)
 
   const parsed = parseFullName(fullName);
   if (!parsed) throw badRequest("Invalid package name");
-  if (!(await canPublish(c.env.DB, user.id, parsed.scope))) {
-    throw forbidden("You don't have permission to delete this version");
+  if (!(await canManage(c.env.DB, user.id, parsed.scope))) {
+    throw forbidden("Only org owners and admins can delete versions");
   }
 
   const ver = await c.env.DB.prepare(
@@ -578,10 +605,14 @@ app.delete("/v1/packages/:fullName/versions/:version", authMiddleware, async (c)
 // PACKAGE ACCESS CONTROL (restricted visibility — per-user ACL)
 // ============================================================
 
-// Get package access list
-app.get("/v1/packages/:fullName/access", authMiddleware, async (c) => {
+// Get package access list (requires admin+ for org packages)
+app.get("/v1/packages/:fullName/access", authMiddleware, requireScope("manage-access"), async (c) => {
   const user = c.get("user");
   const fullName = decodeURIComponent(c.req.param("fullName")!);
+
+  if (!tokenCanActOnPackage(c, fullName)) {
+    throw forbidden(`Token does not have permission to act on package ${fullName}`);
+  }
 
   const pkg = await c.env.DB.prepare(
     "SELECT id, owner_type, owner_id, visibility FROM packages WHERE full_name = ? AND deleted_at IS NULL",
@@ -589,11 +620,11 @@ app.get("/v1/packages/:fullName/access", authMiddleware, async (c) => {
 
   if (!pkg) throw notFound(`Package ${fullName} not found`);
 
-  // Must be scope member
+  // Must be owner/admin for org packages (canManage)
   const parsed = parseFullName(fullName);
   if (!parsed) throw badRequest("Invalid package name");
-  if (!(await canPublish(c.env.DB, user.id, parsed.scope))) {
-    throw forbidden("You don't have permission to manage package access");
+  if (!(await canManage(c.env.DB, user.id, parsed.scope))) {
+    throw forbidden("Only org owners and admins can manage package access");
   }
 
   // For org-owned packages, only owner/admin can manage access
@@ -612,9 +643,13 @@ app.get("/v1/packages/:fullName/access", authMiddleware, async (c) => {
 });
 
 // Update package access list (add/remove users)
-app.patch("/v1/packages/:fullName/access", authMiddleware, async (c) => {
+app.patch("/v1/packages/:fullName/access", authMiddleware, requireScope("manage-access"), async (c) => {
   const user = c.get("user");
   const fullName = decodeURIComponent(c.req.param("fullName")!);
+
+  if (!tokenCanActOnPackage(c, fullName)) {
+    throw forbidden(`Token does not have permission to act on package ${fullName}`);
+  }
 
   let body: { add?: string[]; remove?: string[] };
   try {
@@ -686,9 +721,13 @@ app.patch("/v1/packages/:fullName/access", authMiddleware, async (c) => {
 });
 
 // Rename package (name portion only, within same scope)
-app.patch("/v1/packages/:fullName/rename", authMiddleware, async (c) => {
+app.patch("/v1/packages/:fullName/rename", authMiddleware, requireScope("manage-access"), async (c) => {
   const user = c.get("user");
   const fullName = c.req.param("fullName");
+
+  if (!tokenCanActOnPackage(c, fullName!)) {
+    throw forbidden(`Token does not have permission to act on package ${fullName}`);
+  }
 
   let body: { new_name: string; confirm: string };
   try {
@@ -711,23 +750,12 @@ app.patch("/v1/packages/:fullName/rename", authMiddleware, async (c) => {
 
   if (!pkg) throw notFound(`Package ${fullName} not found`);
 
-  // Check permission (must be able to publish to this scope)
-  const parsed = parseFullName(fullName);
+  // Check permission (requires admin+ for org packages)
+  const parsed = parseFullName(fullName!);
   if (!parsed) throw badRequest("Invalid package name");
 
-  if (!(await canPublish(c.env.DB, user.id, parsed.scope))) {
-    throw forbidden("You don't have permission to rename this package");
-  }
-
-  // For org packages, only owner/admin can rename
-  if (pkg.owner_type === "org") {
-    const membership = await c.env.DB.prepare(
-      "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
-    ).bind(pkg.owner_id, user.id).first<{ role: string }>();
-
-    if (!membership || !["owner", "admin"].includes(membership.role)) {
-      throw forbidden("Only org owners and admins can rename packages");
-    }
+  if (!(await canManage(c.env.DB, user.id, parsed.scope))) {
+    throw forbidden("Only org owners and admins can rename packages");
   }
 
   try {

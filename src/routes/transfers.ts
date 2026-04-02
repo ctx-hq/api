@@ -1,9 +1,9 @@
 import { Hono } from "hono";
 import type { AppEnv } from "../bindings";
-import { authMiddleware } from "../middleware/auth";
+import { authMiddleware, requireScope, tokenCanActOnPackage } from "../middleware/auth";
 import { badRequest, notFound, forbidden, conflict } from "../utils/errors";
 import type { OwnerType } from "../models/types";
-import { canPublish, getOwnerForScope, getOwnerSlug } from "../services/ownership";
+import { canPublish, canAdmin, getOwnerForScope, getOwnerSlug } from "../services/ownership";
 import {
   createTransferRequest,
   acceptTransfer,
@@ -16,10 +16,14 @@ import { notifyOwnerOwners, notify } from "../services/notification";
 
 const app = new Hono<AppEnv>();
 
-// Initiate package transfer
-app.post("/v1/packages/:fullName/transfer", authMiddleware, async (c) => {
+// Initiate package transfer (requires owner for org packages)
+app.post("/v1/packages/:fullName/transfer", authMiddleware, requireScope("manage-access"), async (c) => {
   const user = c.get("user");
   const fullName = c.req.param("fullName");
+
+  if (!tokenCanActOnPackage(c, fullName!)) {
+    throw forbidden(`Token does not have permission to act on package ${fullName}`);
+  }
 
   let body: { to: string; message?: string };
   try {
@@ -40,20 +44,9 @@ app.post("/v1/packages/:fullName/transfer", authMiddleware, async (c) => {
 
   if (!pkg) throw notFound(`Package ${fullName} not found`);
 
-  // Check caller can manage this package (scope-based)
-  if (!(await canPublish(c.env.DB, user.id, pkg.scope))) {
-    throw forbidden("You don't have permission to transfer this package");
-  }
-
-  // For org packages, only owner/admin can transfer (not regular members)
-  if (pkg.owner_type === "org") {
-    const membership = await c.env.DB.prepare(
-      "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
-    ).bind(pkg.owner_id, user.id).first<{ role: string }>();
-
-    if (!membership || !["owner", "admin"].includes(membership.role)) {
-      throw forbidden("Only org owners and admins can transfer packages");
-    }
+  // Transfer requires owner-level access (canAdmin)
+  if (!(await canAdmin(c.env.DB, user.id, pkg.scope))) {
+    throw forbidden("Only scope owners can transfer packages");
   }
 
   // Find target scope owner
@@ -140,20 +133,9 @@ app.delete("/v1/packages/:fullName/transfer", authMiddleware, async (c) => {
 
   if (!pkg) throw notFound(`Package ${fullName} not found`);
 
-  // Check caller is owner/admin of the scope
-  if (!(await canPublish(c.env.DB, user.id, pkg.scope))) {
-    throw forbidden("You don't have permission to cancel this transfer");
-  }
-
-  // For org packages, only owner/admin can cancel
-  if (pkg.owner_type === "org") {
-    const membership = await c.env.DB.prepare(
-      "SELECT role FROM org_members WHERE org_id = ? AND user_id = ?",
-    ).bind(pkg.owner_id, user.id).first<{ role: string }>();
-
-    if (!membership || !["owner", "admin"].includes(membership.role)) {
-      throw forbidden("Only org owners and admins can cancel transfers");
-    }
+  // Cancel requires owner-level access (canAdmin)
+  if (!(await canAdmin(c.env.DB, user.id, pkg.scope))) {
+    throw forbidden("Only scope owners can cancel transfers");
   }
 
   const cancelled = await cancelTransfer(c.env.DB, pkg.id, user.id);

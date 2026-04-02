@@ -20,8 +20,11 @@ app.post("/v1/resolve", optionalAuth, async (c) => {
     throw badRequest("Request body must contain a 'packages' object");
   }
 
+  const includeArtifacts = c.req.query("include_artifacts") === "true";
   const user = c.get("user");
   const resolved: Record<string, unknown> = {};
+  // Track version IDs for batch artifact lookup
+  const versionArtifactMap: { fullName: string; versionId: string; version: string }[] = [];
 
   for (const [fullName, constraint] of Object.entries(body.packages)) {
     const pkg = await c.env.DB.prepare(
@@ -33,9 +36,9 @@ app.post("/v1/resolve", optionalAuth, async (c) => {
       continue;
     }
 
-    // Get all non-yanked versions
+    // Get all non-yanked versions (include id for artifact lookups)
     const versions = await c.env.DB.prepare(
-      "SELECT version, manifest, sha256, formula_key FROM versions WHERE package_id = ? AND yanked = 0 ORDER BY created_at DESC"
+      "SELECT id, version, manifest, sha256, formula_key FROM versions WHERE package_id = ? AND yanked = 0 ORDER BY created_at DESC"
     ).bind(pkg.id).all();
 
     const rows = versions.results ?? [];
@@ -91,7 +94,40 @@ app.post("/v1/resolve", optionalAuth, async (c) => {
         }
       }
 
+      // Track for batch artifact lookup
+      if (includeArtifacts && matched.id) {
+        versionArtifactMap.push({
+          fullName,
+          versionId: matched.id as string,
+          version: matched.version as string,
+        });
+      }
+
       resolved[fullName] = entry;
+    }
+  }
+
+  // Batch fetch artifacts for all resolved versions (opt-in)
+  if (includeArtifacts && versionArtifactMap.length > 0) {
+    const artifactQueries = versionArtifactMap.map((v) =>
+      c.env.DB.prepare(
+        "SELECT version_id, platform, sha256, size FROM version_artifacts WHERE version_id = ? ORDER BY platform"
+      ).bind(v.versionId),
+    );
+    const artifactResults = await c.env.DB.batch(artifactQueries);
+
+    for (let i = 0; i < versionArtifactMap.length; i++) {
+      const { fullName, version } = versionArtifactMap[i];
+      const artifacts = (artifactResults[i] as D1Result<Record<string, unknown>>).results ?? [];
+      if (artifacts.length > 0) {
+        const entry = resolved[fullName] as Record<string, unknown>;
+        entry.artifacts = artifacts.map((a) => ({
+          platform: a.platform,
+          sha256: a.sha256,
+          size: a.size,
+          download_url: `/v1/packages/${encodeURIComponent(fullName)}/versions/${version}/artifacts/${a.platform}`,
+        }));
+      }
     }
   }
 

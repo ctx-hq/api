@@ -70,6 +70,91 @@ export async function canPublishWithOwner(
 }
 
 /**
+ * Check if a user can manage a scope (destructive operations: yank, delete, rename, visibility, deprecation).
+ * - user scope: owner_id must match userId
+ * - org scope: user must be owner or admin (members cannot manage)
+ * Returns true/false.
+ */
+export async function canManage(
+  db: D1Database,
+  userId: string,
+  scopeName: string,
+): Promise<boolean> {
+  return (await canManageWithOwner(db, userId, scopeName)) !== null;
+}
+
+/**
+ * Like canManage but returns the OwnerRef on success, null on failure.
+ */
+export async function canManageWithOwner(
+  db: D1Database,
+  userId: string,
+  scopeName: string,
+): Promise<OwnerRef | null> {
+  const owner = await getOwnerForScope(db, scopeName);
+  if (!owner) return null;
+
+  if (owner.owner_type === "user") {
+    return owner.owner_id === userId ? owner : null;
+  }
+
+  if (owner.owner_type === "org") {
+    const org = await db
+      .prepare("SELECT status FROM orgs WHERE id = ?")
+      .bind(owner.owner_id)
+      .first<{ status: string }>();
+
+    if (org?.status === "archived") return null;
+
+    const membership = await db
+      .prepare("SELECT role FROM org_members WHERE org_id = ? AND user_id = ?")
+      .bind(owner.owner_id, userId)
+      .first<{ role: string }>();
+
+    if (!membership) return null;
+    return ["owner", "admin"].includes(membership.role) ? owner : null;
+  }
+
+  return null;
+}
+
+/**
+ * Check if a user can perform structural operations on a scope (transfer, dissolve, rename org).
+ * - user scope: owner_id must match userId
+ * - org scope: user must be owner only
+ */
+export async function canAdmin(
+  db: D1Database,
+  userId: string,
+  scopeName: string,
+): Promise<boolean> {
+  const owner = await getOwnerForScope(db, scopeName);
+  if (!owner) return false;
+
+  if (owner.owner_type === "user") {
+    return owner.owner_id === userId;
+  }
+
+  if (owner.owner_type === "org") {
+    const org = await db
+      .prepare("SELECT status FROM orgs WHERE id = ?")
+      .bind(owner.owner_id)
+      .first<{ status: string }>();
+
+    if (org?.status === "archived") return false;
+
+    const membership = await db
+      .prepare("SELECT role FROM org_members WHERE org_id = ? AND user_id = ?")
+      .bind(owner.owner_id, userId)
+      .first<{ role: string }>();
+
+    return membership?.role === "owner";
+  }
+
+  return false;
+}
+
+/**
  * Check if a user can access a private package.
  * - public/unlisted: always true
  * - private + user-owned: owner_id === userId

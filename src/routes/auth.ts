@@ -3,6 +3,7 @@ import type { AppEnv } from "../bindings";
 import { generateId } from "../utils/response";
 import { hashToken } from "../services/auth";
 import { authMiddleware } from "../middleware/auth";
+import { validateEndpointScopes, validatePackageScopes, VALID_ENDPOINT_SCOPES } from "../services/token-scope";
 import { badRequest, forbidden, notFound } from "../utils/errors";
 import { SYSTEM_OWNER_ID, SYSTEM_DELETED_ID } from "../models/types";
 import { ensureUserScope } from "../services/ownership";
@@ -333,16 +334,28 @@ app.patch("/v1/me/profile", authMiddleware, async (c) => {
 app.get("/v1/me/tokens", authMiddleware, async (c) => {
   const user = c.get("user");
   const result = await c.env.DB.prepare(
-    "SELECT id, name, created_at, last_used_at, expires_at FROM api_tokens WHERE user_id = ? ORDER BY created_at DESC"
+    "SELECT id, name, endpoint_scopes, package_scopes, token_type, created_at, last_used_at, expires_at FROM api_tokens WHERE user_id = ? ORDER BY created_at DESC"
   ).bind(user.id).all();
 
-  return c.json({ tokens: result.results ?? [] });
+  const tokens = (result.results ?? []).map((t: Record<string, unknown>) => ({
+    ...t,
+    endpoint_scopes: JSON.parse((t.endpoint_scopes as string) || '["*"]'),
+    package_scopes: JSON.parse((t.package_scopes as string) || '["*"]'),
+  }));
+
+  return c.json({ tokens });
 });
 
-// Create a new named token
+// Create a new named token with optional scopes
 app.post("/v1/me/tokens", authMiddleware, async (c) => {
   const user = c.get("user");
-  let body: { name?: string; expires_in_days?: number };
+  let body: {
+    name?: string;
+    expires_in_days?: number;
+    endpoint_scopes?: string[];
+    package_scopes?: string[];
+    token_type?: string;
+  };
   try {
     body = await c.req.json();
   } catch {
@@ -360,20 +373,49 @@ app.post("/v1/me/tokens", authMiddleware, async (c) => {
     }
   }
 
+  // Validate token type
+  const tokenType = body.token_type ?? "personal";
+  if (!["personal", "deploy"].includes(tokenType)) {
+    throw badRequest("token_type must be 'personal' or 'deploy'");
+  }
+
+  // Validate and resolve endpoint scopes
+  let endpointScopes = body.endpoint_scopes ?? ["*"];
+  if (tokenType === "deploy") {
+    // Deploy tokens are read-only — force endpoint scopes
+    endpointScopes = ["read-private"];
+  } else {
+    const invalidEndpoint = validateEndpointScopes(endpointScopes);
+    if (invalidEndpoint) {
+      throw badRequest(`Invalid endpoint scope: "${invalidEndpoint}". Valid scopes: ${VALID_ENDPOINT_SCOPES.join(", ")}`);
+    }
+  }
+
+  // Validate package scopes
+  const packageScopes = body.package_scopes ?? ["*"];
+  const invalidPackage = validatePackageScopes(packageScopes);
+  if (invalidPackage) {
+    throw badRequest(`Invalid package scope pattern: "${invalidPackage}"`);
+  }
+
   const token = `ctx_${generateId()}${generateId()}`;
   const tokenHash = await hashToken(token);
   const tokenId = generateId();
 
-  if (body.expires_in_days) {
-    const expiresAt = new Date(Date.now() + body.expires_in_days * 86400_000).toISOString();
-    await c.env.DB.prepare(
-      "INSERT INTO api_tokens (id, user_id, token_hash, name, expires_at) VALUES (?, ?, ?, ?, ?)"
-    ).bind(tokenId, user.id, tokenHash, tokenName, expiresAt).run();
-  } else {
-    await c.env.DB.prepare(
-      "INSERT INTO api_tokens (id, user_id, token_hash, name) VALUES (?, ?, ?, ?)"
-    ).bind(tokenId, user.id, tokenHash, tokenName).run();
-  }
+  const expiresAt = body.expires_in_days
+    ? new Date(Date.now() + body.expires_in_days * 86400_000).toISOString()
+    : null;
+
+  await c.env.DB.prepare(
+    `INSERT INTO api_tokens (id, user_id, token_hash, name, endpoint_scopes, package_scopes, token_type, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    tokenId, user.id, tokenHash, tokenName,
+    JSON.stringify(endpointScopes),
+    JSON.stringify(packageScopes),
+    tokenType,
+    expiresAt,
+  ).run();
 
   return c.json({ id: tokenId, token, name: tokenName }, 201);
 });

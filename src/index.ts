@@ -26,6 +26,10 @@ import notifications from "./routes/notifications";
 import mcp from "./routes/mcp";
 import claims from "./routes/claims";
 import submissions from "./routes/submissions";
+import stars from "./routes/stars";
+import artifacts from "./routes/artifacts";
+import installScripts from "./routes/install-scripts";
+import trustpub from "./routes/trustpub";
 import { resolvePackageName } from "./services/redirect";
 import { cleanupOldNotifications } from "./services/notification";
 
@@ -106,6 +110,10 @@ app.route("/", notifications);
 app.route("/", mcp);
 app.route("/", claims);
 app.route("/", submissions);
+app.route("/", stars);
+app.route("/", artifacts);
+app.route("/", installScripts);
+app.route("/", trustpub);
 app.route("/", root);
 
 // 404 handler — consistent JSON format for unmatched routes

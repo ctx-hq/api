@@ -1,21 +1,21 @@
 import { Hono } from "hono";
 import type { AppEnv } from "../bindings";
 import type { Visibility } from "../models/types";
-import { authMiddleware } from "../middleware/auth";
+import { authMiddleware, requireScope, tokenCanActOnPackage } from "../middleware/auth";
 import { badRequest, conflict, forbidden, notFound } from "../utils/errors";
 import { isValidFullName, parseFullName } from "../utils/naming";
 import { isValidSemVer } from "../utils/semver";
 import { generateId } from "../utils/response";
-import { computeSHA256, extractTypeMetadata, autoDistTag, upsertSearchDigest } from "../services/publish";
+import { computeSHA256, extractTypeMetadata, autoDistTag, upsertSearchDigest, syncKeywords } from "../services/publish";
 import { enqueueEnrichment } from "../services/enrichment";
-import { canPublish, canPublishWithOwner, ensureUserScope, getOwnerForScope, getOwnerSlug } from "../services/ownership";
+import { canPublish, canPublishWithOwner, canManage, ensureUserScope, getOwnerForScope, getOwnerSlug } from "../services/ownership";
 import { runStructuralCheck } from "../services/trust";
 import { parse as parseYAML } from "yaml";
 
 const app = new Hono<AppEnv>();
 
 // Publish a package
-app.post("/v1/packages", authMiddleware, async (c) => {
+app.post("/v1/packages", authMiddleware, requireScope("publish"), async (c) => {
   const user = c.get("user");
   const formData = await c.req.formData();
   const manifestFile = formData.get("manifest");
@@ -85,6 +85,11 @@ app.post("/v1/packages", authMiddleware, async (c) => {
   }
 
   const parsed = parseFullName(name)!;
+
+  // ── Token package scope check ──
+  if (!tokenCanActOnPackage(c, name)) {
+    throw forbidden(`Token does not have permission to act on package ${name}`);
+  }
 
   // ── Ownership auth ──
   await ensureUserScope(c.env.DB, user.id, user.username);
@@ -237,6 +242,12 @@ app.post("/v1/packages", authMiddleware, async (c) => {
     );
   }
 
+  // ── Sync keywords to normalized tables ──
+  const manifestKeywords = (manifest.keywords as string[]) ?? [];
+  if (manifestKeywords.length > 0) {
+    c.executionCtx.waitUntil(syncKeywords(c.env.DB, pkgId, manifestKeywords));
+  }
+
   // ── Audit event ──
   await c.env.DB.prepare(
     `INSERT INTO audit_events (id, actor_id, action, target_type, target_id, metadata)
@@ -261,11 +272,15 @@ app.post("/v1/packages", authMiddleware, async (c) => {
   }, 201);
 });
 
-// Yank a version
-app.post("/v1/packages/:fullName/versions/:version/yank", authMiddleware, async (c) => {
+// Yank a version (requires admin+ for org packages)
+app.post("/v1/packages/:fullName/versions/:version/yank", authMiddleware, requireScope("yank"), async (c) => {
   const user = c.get("user");
   const fullName = decodeURIComponent(c.req.param("fullName")!);
   const version = c.req.param("version")!;
+
+  if (!tokenCanActOnPackage(c, fullName)) {
+    throw forbidden(`Token does not have permission to act on package ${fullName}`);
+  }
 
   const pkg = await c.env.DB.prepare(
     "SELECT p.* FROM packages p WHERE p.full_name = ? AND p.deleted_at IS NULL",
@@ -275,11 +290,11 @@ app.post("/v1/packages/:fullName/versions/:version/yank", authMiddleware, async 
     throw badRequest("Package not found");
   }
 
-  // Ownership auth for yank
+  // Ownership auth: yank requires admin+ (canManage)
   const parsed = parseFullName(fullName);
   if (parsed) {
-    if (!(await canPublish(c.env.DB, user.id, parsed.scope))) {
-      throw forbidden("You don't have permission to yank this version");
+    if (!(await canManage(c.env.DB, user.id, parsed.scope))) {
+      throw forbidden("Only org owners and admins can yank versions");
     }
   } else if (pkg.owner_id !== user.id) {
     throw forbidden("You don't have permission to yank this version");
