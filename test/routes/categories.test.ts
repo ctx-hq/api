@@ -58,7 +58,6 @@ function createCategoriesApp(db: MockDB) {
   app.use("*", async (c, next) => {
     (c as any).env = {
       DB: db,
-      CACHE: { get: async () => null, put: async () => {}, delete: async () => {} },
     };
     await next();
   });

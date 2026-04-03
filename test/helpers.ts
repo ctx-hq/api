@@ -5,7 +5,6 @@ export function createMockEnv() {
     DB: createMockD1(),
     FORMULAS: createMockR2(),
     PRIVATE_FORMULAS: createMockR2(),
-    CACHE: createMockKV(),
     GITHUB_CLIENT_ID: "test-client-id",
     GITHUB_CLIENT_SECRET: "test-client-secret",
   };
@@ -77,17 +76,3 @@ export function createMockR2() {
   };
 }
 
-function createMockKV() {
-  const store = new Map<string, string>();
-  return {
-    async get(key: string) {
-      return store.get(key) ?? null;
-    },
-    async put(key: string, value: string, opts?: { expirationTtl?: number }) {
-      store.set(key, value);
-    },
-    async delete(key: string) {
-      store.delete(key);
-    },
-  };
-}

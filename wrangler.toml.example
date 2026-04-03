@@ -21,10 +21,6 @@ bucket_name = "ctx-formulas"
 binding = "PRIVATE_FORMULAS"
 bucket_name = "ctx-formulas-private"
 
-[[kv_namespaces]]
-binding = "CACHE"
-id = "<your-kv-namespace-id>"
-
 [[vectorize]]
 binding = "VECTORIZE"
 index_name = "ctx-packages"
@@ -70,10 +66,6 @@ bucket_name = "ctx-formulas-staging"
 [[env.staging.r2_buckets]]
 binding = "PRIVATE_FORMULAS"
 bucket_name = "ctx-formulas-private-staging"
-
-[[env.staging.kv_namespaces]]
-binding = "CACHE"
-id = "<your-staging-kv-id>"
 
 # VECTORIZE, AI, ENRICHMENT_QUEUE intentionally omitted for staging
 # Add them if staging needs search, enrichment, or embedding features

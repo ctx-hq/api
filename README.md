@@ -34,7 +34,7 @@ pnpm install
 
 # Set up Cloudflare resources
 cp wrangler.toml.example wrangler.toml
-# Edit wrangler.toml — fill in your D1 database_id and KV namespace id
+# Edit wrangler.toml — fill in your D1 database_id
 
 # Create local database and start dev server
 pnpm db:migrate
@@ -59,7 +59,6 @@ pnpm dev
 2. **Create Cloudflare resources** (first time only):
    ```bash
    wrangler d1 create ctx-registry       # Copy the database_id into wrangler.toml
-   wrangler kv namespace create CACHE    # Copy the id into wrangler.toml
    wrangler r2 bucket create ctx-formulas
    ```
 
@@ -92,7 +91,6 @@ Pushes to `main` trigger automatic deployment via GitHub Actions. Required secre
 |--------|---------|
 | `CLOUDFLARE_API_TOKEN` | Wrangler deploy authentication |
 | `D1_DATABASE_ID` | D1 database identifier |
-| `KV_NAMESPACE_ID` | KV namespace identifier |
 
 ## API Reference
 

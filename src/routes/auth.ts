@@ -18,24 +18,14 @@ app.post("/v1/auth/device", async (c) => {
   crypto.getRandomValues(bytes);
   const userCode = Array.from(bytes).map(b => b.toString(36)).join("").slice(0, 8).toUpperCase();
 
-  const ttl = 900;
-
-  // Store device code + reverse mapping in KV with 15 min TTL
+  // Store device code in D1 with 15 min expiry
   try {
-    await Promise.all([
-      c.env.CACHE.put(
-        `device:${deviceCode}`,
-        JSON.stringify({ user_code: userCode, status: "pending" }),
-        { expirationTtl: ttl }
-      ),
-      c.env.CACHE.put(
-        `usercode:${userCode}`,
-        deviceCode,
-        { expirationTtl: ttl }
-      ),
-    ]);
+    await c.env.DB.prepare(
+      `INSERT INTO device_codes (device_code, user_code, status, expires_at)
+       VALUES (?, ?, 'pending', datetime('now', '+900 seconds'))`
+    ).bind(deviceCode, userCode).run();
   } catch (err) {
-    console.error("Device flow KV error:", err);
+    console.error("Device flow DB error:", err);
     return c.json(
       { error: "service_unavailable", message: "Authentication service temporarily unavailable. Please try again later." },
       503,
@@ -47,7 +37,7 @@ app.post("/v1/auth/device", async (c) => {
     user_code: userCode,
     verification_uri: "https://getctx.org/login/device",
     verification_uri_complete: `https://getctx.org/login/device?code=${userCode}`,
-    expires_in: ttl,
+    expires_in: 900,
     interval: 5,
   });
 });
@@ -68,37 +58,18 @@ app.post("/v1/auth/device/authorize", authMiddleware, async (c) => {
     throw badRequest("user_code is required");
   }
 
-  // Delete reverse mapping first as optimistic lock — if two concurrent
-  // requests race, only one will find the mapping and proceed.
-  const deviceCode = await c.env.CACHE.get(`usercode:${userCode}`);
-  if (!deviceCode) {
+  // Atomically mark as authorized — UPDATE with WHERE status='pending' acts as
+  // optimistic lock: if two concurrent requests race, only one will match.
+  const result = await c.env.DB.prepare(
+    `UPDATE device_codes
+     SET status = 'authorized', github_id = ?, username = ?, email = ?,
+         expires_at = datetime('now', '+120 seconds')
+     WHERE UPPER(user_code) = ? AND status = 'pending' AND expires_at > datetime('now')`
+  ).bind(user.github_id, user.username, user.email ?? "", userCode).run();
+
+  if (!result.meta.changes) {
     throw badRequest("Invalid or expired code");
   }
-  await c.env.CACHE.delete(`usercode:${userCode}`);
-
-  // Check current status
-  const stored = await c.env.CACHE.get(`device:${deviceCode}`);
-  if (!stored) {
-    throw badRequest("Invalid or expired code");
-  }
-
-  const data = JSON.parse(stored);
-  if (data.status === "authorized") {
-    throw badRequest("Code already used");
-  }
-
-  // Mark as authorized — short TTL, CLI only needs to poll once
-  await c.env.CACHE.put(
-    `device:${deviceCode}`,
-    JSON.stringify({
-      user_code: userCode,
-      status: "authorized",
-      github_id: user.github_id,
-      username: user.username,
-      email: user.email ?? "",
-    }),
-    { expirationTtl: 120 }
-  );
 
   return c.json({ authorized: true });
 });
@@ -112,17 +83,19 @@ app.post("/v1/auth/token", async (c) => {
     return c.json({ error: "invalid_request" }, 400);
   }
 
-  const stored = await c.env.CACHE.get(`device:${deviceCode}`);
-  if (!stored) {
+  const row = await c.env.DB.prepare(
+    "SELECT * FROM device_codes WHERE device_code = ? AND expires_at > datetime('now')"
+  ).bind(deviceCode).first<{ status: string; github_id: string; username: string; email: string }>();
+
+  if (!row) {
     return c.json({ error: "expired_token" }, 400);
   }
 
-  const data = JSON.parse(stored);
-  if (data.status === "pending") {
+  if (row.status === "pending") {
     return c.json({ error: "authorization_pending" }, 400);
   }
 
-  if (data.status === "authorized") {
+  if (row.status === "authorized") {
     // Generate API token
     const token = `ctx_${generateId()}${generateId()}`;
     const tokenHash = await hashToken(token);
@@ -130,18 +103,18 @@ app.post("/v1/auth/token", async (c) => {
     // Ensure user exists
     let user = await c.env.DB.prepare(
       "SELECT id FROM users WHERE github_id = ?"
-    ).bind(data.github_id).first();
+    ).bind(row.github_id).first();
 
     if (!user) {
       const userId = generateId();
       await c.env.DB.prepare(
         "INSERT INTO users (id, username, email, github_id) VALUES (?, ?, ?, ?)"
-      ).bind(userId, data.username, data.email ?? "", data.github_id).run();
+      ).bind(userId, row.username, row.email ?? "", row.github_id).run();
       user = { id: userId };
     }
 
     // Auto-create personal scope
-    const scopeOk = await ensureUserScope(c.env.DB, user.id as string, data.username);
+    const scopeOk = await ensureUserScope(c.env.DB, user.id as string, row.username);
 
     // Create API token
     await c.env.DB.prepare(
@@ -149,7 +122,7 @@ app.post("/v1/auth/token", async (c) => {
     ).bind(generateId(), user.id, tokenHash).run();
 
     // Clean up device code
-    await c.env.CACHE.delete(`device:${deviceCode}`);
+    await c.env.DB.prepare("DELETE FROM device_codes WHERE device_code = ?").bind(deviceCode).run();
 
     const response: Record<string, unknown> = {
       access_token: token,
@@ -157,7 +130,7 @@ app.post("/v1/auth/token", async (c) => {
       scope: "read write",
     };
     if (!scopeOk) {
-      response.warning = `Scope @${data.username} is owned by another entity. You may not be able to publish to @${data.username}.`;
+      response.warning = `Scope @${row.username} is owned by another entity. You may not be able to publish to @${row.username}.`;
     }
     return c.json(response);
   }

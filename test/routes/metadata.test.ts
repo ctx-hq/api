@@ -106,7 +106,6 @@ function createMetadataApp(opts?: {
   app.use("*", async (c, next) => {
     (c as any).env = {
       DB: db,
-      CACHE: { get: async () => null, put: async () => {}, delete: async () => {} },
       ENRICHMENT_QUEUE: { send: async () => { enrichmentQueued = true; } },
     };
     await next();

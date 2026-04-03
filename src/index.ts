@@ -73,6 +73,12 @@ app.use("/v1/*", async (c, next) => {
         c.env.DB.prepare(
           "DELETE FROM audit_events WHERE created_at < datetime('now', '-90 days') LIMIT 1000"
         ).run(),
+        c.env.DB.prepare(
+          "DELETE FROM device_codes WHERE expires_at < datetime('now') LIMIT 500"
+        ).run(),
+        c.env.DB.prepare(
+          "DELETE FROM used_oidc_tokens WHERE expires_at < datetime('now') LIMIT 500"
+        ).run(),
         cleanupOldNotifications(c.env.DB),
       ])
     );

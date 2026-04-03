@@ -56,7 +56,7 @@ function createPackageListApp(db: MockDB, user?: { id: string }) {
   const app = new Hono<AppEnv>();
 
   app.use("*", async (c, next) => {
-    (c as any).env = { DB: db, CACHE: { get: async () => null, put: async () => {}, delete: async () => {} } };
+    (c as any).env = { DB: db };
     if (user) c.set("user", user as any);
     await next();
   });
@@ -228,7 +228,6 @@ function createDeleteApp(overrides?: {
         head: async () => null,
         delete: async (key: string) => { r2Deleted.push(key); },
       },
-      CACHE: { get: async () => null, put: async () => {}, delete: async () => {} },
       VECTORIZE: {
         deleteByIds: async (ids: string[]) => { vectorDeleted.push(...ids); },
         query: async () => ({ matches: [] }),
@@ -481,7 +480,6 @@ function createDetailApp(db: MockDB, user?: { id: string }) {
   app.use("*", async (c, next) => {
     (c as any).env = {
       DB: db,
-      CACHE: { get: async () => null, put: async () => {}, delete: async () => {} },
     };
     if (user) c.set("user", user as any);
     await next();

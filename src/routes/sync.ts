@@ -37,22 +37,20 @@ app.put("/v1/me/sync-profile", authMiddleware, async (c) => {
   const syncable = profile.packages.filter((p) => p.syncable).length;
   const unsyncable = profile.packages.length - syncable;
 
-  // Store profile JSON in KV
-  await c.env.CACHE.put(`sync:${user.id}`, JSON.stringify(profile));
-
-  // Upsert sync metadata in D1
+  // Upsert sync profile (metadata + JSON) in D1
   await c.env.DB.prepare(
-    `INSERT INTO sync_profiles (user_id, device_name, package_count, syncable_count, unsyncable_count, last_push_at, last_push_device)
-     VALUES (?, ?, ?, ?, ?, datetime('now'), ?)
+    `INSERT INTO sync_profiles (user_id, device_name, package_count, syncable_count, unsyncable_count, last_push_at, last_push_device, profile_json)
+     VALUES (?, ?, ?, ?, ?, datetime('now'), ?, ?)
      ON CONFLICT (user_id) DO UPDATE SET
        device_name = excluded.device_name,
        package_count = excluded.package_count,
        syncable_count = excluded.syncable_count,
        unsyncable_count = excluded.unsyncable_count,
        last_push_at = datetime('now'),
-       last_push_device = excluded.last_push_device`,
+       last_push_device = excluded.last_push_device,
+       profile_json = excluded.profile_json`,
   )
-    .bind(user.id, profile.device ?? "", profile.packages.length, syncable, unsyncable, profile.device ?? "")
+    .bind(user.id, profile.device ?? "", profile.packages.length, syncable, unsyncable, profile.device ?? "", JSON.stringify(profile))
     .run();
 
   return c.json({
@@ -67,26 +65,21 @@ app.put("/v1/me/sync-profile", authMiddleware, async (c) => {
 app.get("/v1/me/sync-profile", authMiddleware, async (c) => {
   const user = c.get("user");
 
-  const profileJson = await c.env.CACHE.get(`sync:${user.id}`);
-  if (!profileJson) throw notFound("No sync profile found. Run 'ctx sync push' to create one.");
-
-  const meta = await c.env.DB.prepare(
+  const row = await c.env.DB.prepare(
     "SELECT * FROM sync_profiles WHERE user_id = ?",
   )
     .bind(user.id)
-    .first();
+    .first<Record<string, unknown>>();
 
+  // profile_json was migrated from KV to D1. Pre-migration profiles (metadata in D1
+  // but JSON in KV) will appear as missing and require a re-push. This is acceptable
+  // as the project has not launched yet.
+  if (!row?.profile_json) throw notFound("No sync profile found. Run 'ctx sync push' to create one.");
+
+  const { profile_json, ...meta } = row;
   return c.json({
-    profile: JSON.parse(profileJson),
-    meta: meta ?? {
-      package_count: 0,
-      syncable_count: 0,
-      unsyncable_count: 0,
-      last_push_at: null,
-      last_pull_at: null,
-      last_push_device: "",
-      last_pull_device: "",
-    },
+    profile: JSON.parse(profile_json as string),
+    meta,
   });
 });
 

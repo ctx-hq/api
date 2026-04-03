@@ -61,7 +61,6 @@ function createPublishApp(user: { id: string; username: string }) {
       DB: db,
       FORMULAS: { put: async () => {}, get: async () => null, head: async () => null, delete: async () => {} },
       PRIVATE_FORMULAS: { put: async () => {}, get: async () => null, head: async () => null, delete: async () => {} },
-      CACHE: { get: async () => null, put: async () => {}, delete: async () => {} },
       ENRICHMENT_QUEUE: { send: async () => {} },
     };
     await next();
@@ -266,7 +265,6 @@ describe("publish route — scope enforcement", () => {
         DB: db,
         FORMULAS: { put: async () => {}, get: async () => null, head: async () => null, delete: async () => {} },
         PRIVATE_FORMULAS: { put: async () => {}, get: async () => null, head: async () => null, delete: async () => {} },
-        CACHE: { get: async () => null, put: async () => {}, delete: async () => {} },
         ENRICHMENT_QUEUE: { send: async () => {} },
       };
       await next();
@@ -533,7 +531,6 @@ describe("publish route — bucket routing by visibility", () => {
           put: async (key: string) => { privatePuts.push(key); },
           get: async () => null, head: async () => null, delete: async () => {},
         },
-        CACHE: { get: async () => null, put: async () => {}, delete: async () => {} },
         ENRICHMENT_QUEUE: { send: async () => {} },
       };
       await next();

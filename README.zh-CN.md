@@ -34,7 +34,7 @@ pnpm install
 
 # 配置 Cloudflare 资源
 cp wrangler.toml.example wrangler.toml
-# 编辑 wrangler.toml —— 填入你的 D1 database_id 和 KV namespace id
+# 编辑 wrangler.toml —— 填入你的 D1 database_id
 
 # 创建本地数据库并启动
 pnpm db:migrate
@@ -59,7 +59,6 @@ pnpm dev
 2. **创建 Cloudflare 资源**（仅首次）：
    ```bash
    wrangler d1 create ctx-registry       # 将 database_id 填入 wrangler.toml
-   wrangler kv namespace create CACHE    # 将 id 填入 wrangler.toml
    wrangler r2 bucket create ctx-formulas
    ```
 
@@ -92,7 +91,6 @@ pnpm dev
 |--------|------|
 | `CLOUDFLARE_API_TOKEN` | Wrangler 部署认证 |
 | `D1_DATABASE_ID` | D1 数据库标识符 |
-| `KV_NAMESPACE_ID` | KV 命名空间标识符 |
 
 ## API 参考
 

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeAll } from "vitest";
+import { describe, it, expect, vi, beforeAll, afterEach } from "vitest";
 import { Hono } from "hono";
 import type { AppEnv } from "../../src/bindings";
 import { AppError } from "../../src/utils/errors";
@@ -22,6 +22,10 @@ beforeAll(async () => {
   ) as CryptoKeyPair;
   rsaJWK = await crypto.subtle.exportKey("jwk", rsaKeyPair.publicKey) as JsonWebKey;
   (rsaJWK as unknown as Record<string, unknown>).kid = "test-key-1";
+});
+
+afterEach(() => {
+  delete (globalThis as any).caches;
 });
 
 async function signedJWT(payload: Record<string, unknown>): Promise<string> {
@@ -157,6 +161,7 @@ function createMockDB(opts: {
 
 function createApp(dbOpts: Parameters<typeof createMockDB>[0]) {
   const db = createMockDB(dbOpts);
+
   const app = new Hono<AppEnv>();
 
   app.onError((err, c) => {
@@ -170,7 +175,6 @@ function createApp(dbOpts: Parameters<typeof createMockDB>[0]) {
   app.use("*", async (c, next) => {
     (c as any).env = {
       DB: db,
-      CACHE: { get: async () => null, put: async () => {}, delete: async () => {} },
     };
     await next();
   });

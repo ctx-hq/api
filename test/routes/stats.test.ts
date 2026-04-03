@@ -94,7 +94,6 @@ function createStatsApp(dbOverrides?: Parameters<typeof createMockDB>[0]) {
   app.use("*", async (c, next) => {
     (c as any).env = {
       DB: db,
-      CACHE: { get: async () => null, put: async () => {}, delete: async () => {} },
     };
     await next();
   });

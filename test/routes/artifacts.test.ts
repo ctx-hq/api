@@ -101,7 +101,6 @@ function createApp(dbOpts: Parameters<typeof createArtifactMockDB>[0], r2Overrid
       DB: db,
       FORMULAS: r2,
       PRIVATE_FORMULAS: r2Private,
-      CACHE: { get: async () => null, put: async () => {}, delete: async () => {} },
     };
     await next();
   });
@@ -281,7 +280,6 @@ describe("GET /v1/packages/:fullName/versions/:version/artifacts", () => {
           batch: db.batch,
         },
         FORMULAS: { get: async () => null },
-        CACHE: { get: async () => null, put: async () => {}, delete: async () => {} },
       };
       // No user set → anonymous
       await next();
@@ -366,7 +364,6 @@ describe("GET /v1/packages/:fullName/versions/:version/artifacts/:platform", () 
         FORMULAS: {
           get: async () => mockR2Object,
         },
-        CACHE: { get: async () => null, put: async () => {}, delete: async () => {} },
       };
       await next();
     });

@@ -69,7 +69,7 @@ function createTestApp(mockUser: { id: string; username: string; email: string; 
   // Inject mock env
   app.use("*", async (c, next) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (c as any).env = { DB: db, CACHE: { get: async () => null, put: async () => {}, delete: async () => {} } };
+    (c as any).env = { DB: db };
     await next();
   });
 

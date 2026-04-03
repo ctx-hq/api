@@ -152,7 +152,7 @@ function createProfileApp(authedUser?: { id: string }) {
     return c.json({ error: "internal_error" }, 500);
   });
   app.use("*", async (c, next) => {
-    (c as any).env = { DB: db, CACHE: { get: async () => null, put: async () => {}, delete: async () => {} } };
+    (c as any).env = { DB: db };
     if (authedUser) c.set("user", authedUser as any);
     await next();
   });

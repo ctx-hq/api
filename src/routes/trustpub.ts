@@ -37,18 +37,17 @@ app.post("/v1/trustpub/exchange", async (c) => {
     throw forbidden("OIDC token has expired");
   }
 
-  // Replay prevention: use jti claim as nonce, check via KV cache
+  // Replay prevention: atomic INSERT OR IGNORE + check changes to eliminate TOCTOU race.
+  // D1 for global consistency — Cache API is per-colo and cannot prevent cross-colo replay.
   const jti = (claims as unknown as Record<string, unknown>).jti as string | undefined;
   if (jti) {
-    const cacheKey = `oidc:jti:${jti}`;
-    const used = await c.env.CACHE.get(cacheKey);
-    if (used) {
+    const expiresAt = new Date((claims.exp + 300) * 1000).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+    const insertResult = await c.env.DB.prepare(
+      "INSERT OR IGNORE INTO used_oidc_tokens (jti, expires_at) VALUES (?, ?)"
+    ).bind(jti, expiresAt).run();
+    if (!insertResult.meta.changes) {
       throw forbidden("OIDC token has already been used");
     }
-    // Mark as used with TTL matching token validity (5 minutes buffer)
-    c.executionCtx.waitUntil(
-      c.env.CACHE.put(cacheKey, "1", { expirationTtl: 600 })
-    );
   }
 
   // Find matching trusted publisher configs by repository

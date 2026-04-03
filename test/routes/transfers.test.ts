@@ -179,7 +179,7 @@ function createTransferApp(opts?: {
   });
 
   app.use("*", async (c, next) => {
-    (c as any).env = { DB: db, CACHE: { get: async () => null, put: async () => {}, delete: async () => {} } };
+    (c as any).env = { DB: db };
     if (user) c.set("user", user as any);
     await next();
   });

@@ -31,36 +31,12 @@ vi.mock("../../src/middleware/auth", () => ({
 // Import actual routes AFTER mocks are set up
 import authRoutes from "../../src/routes/auth";
 
-// --- Mock KV store ---
-
-interface MockKV {
-  _store: Map<string, { value: string; ttl?: number }>;
-  get(key: string): Promise<string | null>;
-  put(key: string, value: string, opts?: { expirationTtl?: number }): Promise<void>;
-  delete(key: string): Promise<void>;
-}
-
-function createMockKV(): MockKV {
-  const store = new Map<string, { value: string; ttl?: number }>();
-  return {
-    _store: store,
-    async get(key: string) {
-      return store.get(key)?.value ?? null;
-    },
-    async put(key: string, value: string, opts?: { expirationTtl?: number }) {
-      store.set(key, { value, ttl: opts?.expirationTtl });
-    },
-    async delete(key: string) {
-      store.delete(key);
-    },
-  };
-}
-
-// --- Mock DB ---
+// --- Mock DB with device_codes table support ---
 
 interface MockDB {
   prepare(sql: string): MockStatement;
   _executed: Array<{ sql: string; params: unknown[] }>;
+  _deviceCodes: Map<string, { device_code: string; user_code: string; status: string; github_id?: string; username?: string; email?: string; expires_at: string }>;
 }
 
 interface MockStatement {
@@ -72,10 +48,15 @@ interface MockStatement {
 
 function createMockDB(overrides?: {
   firstFn?: (sql: string, params: unknown[]) => unknown | null;
+  runFn?: (sql: string, params: unknown[]) => { success: boolean; meta: { changes: number } } | undefined;
+  failOnInsertDeviceCode?: boolean;
 }): MockDB {
   const executed: Array<{ sql: string; params: unknown[] }> = [];
+  const deviceCodes = new Map<string, { device_code: string; user_code: string; status: string; github_id?: string; username?: string; email?: string; expires_at: string }>();
+
   const db: MockDB = {
     _executed: executed,
+    _deviceCodes: deviceCodes,
     prepare(sql: string) {
       let boundParams: unknown[] = [];
       const stmt: MockStatement = {
@@ -85,7 +66,24 @@ function createMockDB(overrides?: {
         },
         async first<T>(): Promise<T | null> {
           executed.push({ sql, params: boundParams });
-          return (overrides?.firstFn?.(sql, boundParams) as T) ?? null;
+
+          // Override takes precedence
+          if (overrides?.firstFn) {
+            const result = overrides.firstFn(sql, boundParams);
+            if (result !== undefined) return result as T;
+          }
+
+          // device_codes SELECT by device_code
+          if (sql.includes("FROM device_codes") && sql.includes("device_code = ?")) {
+            const code = boundParams[0] as string;
+            const row = deviceCodes.get(code);
+            if (row && new Date(row.expires_at) > new Date()) {
+              return row as unknown as T;
+            }
+            return null;
+          }
+
+          return null;
         },
         async all() {
           executed.push({ sql, params: boundParams });
@@ -93,6 +91,58 @@ function createMockDB(overrides?: {
         },
         async run() {
           executed.push({ sql, params: boundParams });
+
+          // Override takes precedence
+          if (overrides?.runFn) {
+            const result = overrides.runFn(sql, boundParams);
+            if (result) return result;
+          }
+
+          // INSERT INTO device_codes
+          if (sql.includes("INSERT INTO device_codes")) {
+            if (overrides?.failOnInsertDeviceCode) {
+              throw new Error("D1_ERROR: database unavailable");
+            }
+            const [deviceCode, userCode] = boundParams as [string, string];
+            deviceCodes.set(deviceCode, {
+              device_code: deviceCode,
+              user_code: userCode,
+              status: "pending",
+              // Simulate SQLite datetime('now', '+900 seconds')
+              expires_at: new Date(Date.now() + 900_000).toISOString(),
+            });
+            return { success: true, meta: { changes: 1 } };
+          }
+
+          // UPDATE device_codes SET status = 'authorized'
+          if (sql.includes("UPDATE device_codes") && sql.includes("status = 'authorized'")) {
+            const [githubId, username, email, userCode] = boundParams as [string, string, string, string];
+            // Find by user_code with status=pending (UPPER() comparison)
+            for (const [key, row] of deviceCodes) {
+              if (row.user_code.toUpperCase() === userCode.toUpperCase() && row.status === "pending" && new Date(row.expires_at) > new Date()) {
+                row.status = "authorized";
+                row.github_id = githubId;
+                row.username = username;
+                row.email = email;
+                row.expires_at = new Date(Date.now() + 120_000).toISOString();
+                return { success: true, meta: { changes: 1 } };
+              }
+            }
+            return { success: true, meta: { changes: 0 } };
+          }
+
+          // DELETE FROM device_codes WHERE device_code = ?
+          if (sql.includes("DELETE FROM device_codes") && sql.includes("device_code = ?")) {
+            const code = boundParams[0] as string;
+            const deleted = deviceCodes.delete(code);
+            return { success: true, meta: { changes: deleted ? 1 : 0 } };
+          }
+
+          // DELETE expired device codes (cleanup)
+          if (sql.includes("DELETE FROM device_codes") && sql.includes("expires_at")) {
+            return { success: true, meta: { changes: 0 } };
+          }
+
           return { success: true, meta: { changes: 1 } };
         },
       };
@@ -104,14 +154,13 @@ function createMockDB(overrides?: {
 
 // --- Build test app mounting actual auth routes ---
 
-function createTestApp(cache: MockKV, db: MockDB) {
+function createTestApp(db: MockDB) {
   const app = new Hono<AppEnv>();
 
   // Inject mock env
   app.use("*", async (c, next) => {
     (c as any).env = {
       DB: db,
-      CACHE: cache,
       GITHUB_CLIENT_ID: "test-client-id",
       GITHUB_CLIENT_SECRET: "test-client-secret",
     };
@@ -129,18 +178,21 @@ function createTestApp(cache: MockKV, db: MockDB) {
     return c.json({ error: "internal_error", message: err.message }, 500);
   });
 
-  return app;
+  const mockExecCtx = { waitUntil: () => {}, passThroughOnException: () => {} };
+  const request: typeof app.request = (input, init, env) =>
+    app.request(input, init, env, mockExecCtx as any);
+
+  return { app, request };
 }
 
 // --- Tests ---
 
 describe("POST /v1/auth/device — device code creation", () => {
   it("returns all required RFC 8628 fields including verification_uri_complete", async () => {
-    const cache = createMockKV();
     const db = createMockDB();
-    const app = createTestApp(cache, db);
+    const { request } = createTestApp(db);
 
-    const res = await app.request("/v1/auth/device", { method: "POST" });
+    const res = await request("/v1/auth/device", { method: "POST" });
     expect(res.status).toBe(200);
 
     const body = (await res.json()) as Record<string, unknown>;
@@ -153,54 +205,31 @@ describe("POST /v1/auth/device — device code creation", () => {
     expect(body).toHaveProperty("interval", 5);
   });
 
-  it("stores device code and reverse mapping in KV", async () => {
-    const cache = createMockKV();
+  it("stores device code in D1", async () => {
     const db = createMockDB();
-    const app = createTestApp(cache, db);
+    const { request } = createTestApp(db);
 
-    const res = await app.request("/v1/auth/device", { method: "POST" });
+    const res = await request("/v1/auth/device", { method: "POST" });
     const body = (await res.json()) as { device_code: string; user_code: string };
 
-    // Check device code stored
-    const deviceData = await cache.get(`device:${body.device_code}`);
-    expect(deviceData).not.toBeNull();
-    const parsed = JSON.parse(deviceData!);
-    expect(parsed.status).toBe("pending");
-    expect(parsed.user_code).toBe(body.user_code);
+    // Verify device code stored in D1
+    const row = db._deviceCodes.get(body.device_code);
+    expect(row).toBeDefined();
+    expect(row!.status).toBe("pending");
+    expect(row!.user_code).toBe(body.user_code);
 
-    // Check reverse mapping stored
-    const reverseMapping = await cache.get(`usercode:${body.user_code}`);
-    expect(reverseMapping).toBe(body.device_code);
-  });
-
-  it("stores KV entries with 900s TTL", async () => {
-    const cache = createMockKV();
-    const db = createMockDB();
-    const app = createTestApp(cache, db);
-
-    const res = await app.request("/v1/auth/device", { method: "POST" });
-    const body = (await res.json()) as { device_code: string; user_code: string };
-
-    const deviceEntry = cache._store.get(`device:${body.device_code}`);
-    expect(deviceEntry?.ttl).toBe(900);
-
-    const usercodeEntry = cache._store.get(`usercode:${body.user_code}`);
-    expect(usercodeEntry?.ttl).toBe(900);
+    // Verify INSERT was executed
+    const insert = db._executed.find((e) => e.sql.includes("INSERT INTO device_codes"));
+    expect(insert).toBeDefined();
   });
 });
 
-describe("POST /v1/auth/device — KV failure handling", () => {
-  it("returns 503 when KV is unavailable", async () => {
-    const failingKV: MockKV = {
-      _store: new Map(),
-      async get() { throw new Error("KV put() limit exceeded for the day."); },
-      async put() { throw new Error("KV put() limit exceeded for the day."); },
-      async delete() { throw new Error("KV put() limit exceeded for the day."); },
-    };
-    const db = createMockDB();
-    const app = createTestApp(failingKV, db);
+describe("POST /v1/auth/device — DB failure handling", () => {
+  it("returns 503 when DB is unavailable", async () => {
+    const db = createMockDB({ failOnInsertDeviceCode: true });
+    const { request } = createTestApp(db);
 
-    const res = await app.request("/v1/auth/device", { method: "POST" });
+    const res = await request("/v1/auth/device", { method: "POST" });
     expect(res.status).toBe(503);
 
     const body = (await res.json()) as { error: string; message: string };
@@ -210,28 +239,26 @@ describe("POST /v1/auth/device — KV failure handling", () => {
 });
 
 describe("POST /v1/auth/device/authorize — device code authorization", () => {
-  let cache: MockKV;
   let db: MockDB;
   let deviceCode: string;
   let userCode: string;
 
   beforeEach(async () => {
     mockAuthUser = testUser;
-    cache = createMockKV();
     db = createMockDB();
 
     // Create a device code via the actual endpoint
-    const app = createTestApp(cache, db);
-    const res = await app.request("/v1/auth/device", { method: "POST" });
+    const { request } = createTestApp(db);
+    const res = await request("/v1/auth/device", { method: "POST" });
     const body = (await res.json()) as { device_code: string; user_code: string };
     deviceCode = body.device_code;
     userCode = body.user_code;
   });
 
-  it("authorizes a valid code and updates KV", async () => {
-    const app = createTestApp(cache, db);
+  it("authorizes a valid code and updates D1", async () => {
+    const { request } = createTestApp(db);
 
-    const res = await app.request("/v1/auth/device/authorize", {
+    const res = await request("/v1/auth/device/authorize", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ user_code: userCode }),
@@ -241,34 +268,17 @@ describe("POST /v1/auth/device/authorize — device code authorization", () => {
     const body = (await res.json()) as { authorized: boolean };
     expect(body.authorized).toBe(true);
 
-    // Verify device code updated to authorized
-    const deviceData = JSON.parse((await cache.get(`device:${deviceCode}`))!);
-    expect(deviceData.status).toBe("authorized");
-    expect(deviceData.github_id).toBe(testUser.github_id);
-    expect(deviceData.username).toBe(testUser.username);
-
-    // Verify reverse mapping deleted (optimistic lock)
-    const reverseMapping = await cache.get(`usercode:${userCode}`);
-    expect(reverseMapping).toBeNull();
-  });
-
-  it("stores authorized status with short TTL (120s)", async () => {
-    const app = createTestApp(cache, db);
-
-    await app.request("/v1/auth/device/authorize", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ user_code: userCode }),
-    });
-
-    const entry = cache._store.get(`device:${deviceCode}`);
-    expect(entry?.ttl).toBe(120);
+    // Verify device code updated to authorized in D1
+    const row = db._deviceCodes.get(deviceCode);
+    expect(row!.status).toBe("authorized");
+    expect(row!.github_id).toBe(testUser.github_id);
+    expect(row!.username).toBe(testUser.username);
   });
 
   it("handles case-insensitive user codes", async () => {
-    const app = createTestApp(cache, db);
+    const { request } = createTestApp(db);
 
-    const res = await app.request("/v1/auth/device/authorize", {
+    const res = await request("/v1/auth/device/authorize", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ user_code: userCode.toLowerCase() }),
@@ -278,9 +288,9 @@ describe("POST /v1/auth/device/authorize — device code authorization", () => {
   });
 
   it("returns 400 for invalid/expired code", async () => {
-    const app = createTestApp(cache, db);
+    const { request } = createTestApp(db);
 
-    const res = await app.request("/v1/auth/device/authorize", {
+    const res = await request("/v1/auth/device/authorize", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ user_code: "BADCODE1" }),
@@ -292,17 +302,17 @@ describe("POST /v1/auth/device/authorize — device code authorization", () => {
   });
 
   it("returns 400 for already authorized code (optimistic lock)", async () => {
-    const app = createTestApp(cache, db);
+    const { request } = createTestApp(db);
 
     // First authorization succeeds
-    await app.request("/v1/auth/device/authorize", {
+    await request("/v1/auth/device/authorize", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ user_code: userCode }),
     });
 
-    // Second attempt fails — reverse mapping already deleted
-    const res = await app.request("/v1/auth/device/authorize", {
+    // Second attempt fails — status is no longer 'pending'
+    const res = await request("/v1/auth/device/authorize", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ user_code: userCode }),
@@ -314,9 +324,9 @@ describe("POST /v1/auth/device/authorize — device code authorization", () => {
   });
 
   it("returns 400 for missing user_code", async () => {
-    const app = createTestApp(cache, db);
+    const { request } = createTestApp(db);
 
-    const res = await app.request("/v1/auth/device/authorize", {
+    const res = await request("/v1/auth/device/authorize", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({}),
@@ -327,9 +337,9 @@ describe("POST /v1/auth/device/authorize — device code authorization", () => {
 
   it("returns 401 for unauthenticated request", async () => {
     mockAuthUser = null;
-    const app = createTestApp(cache, db);
+    const { request } = createTestApp(db);
 
-    const res = await app.request("/v1/auth/device/authorize", {
+    const res = await request("/v1/auth/device/authorize", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ user_code: userCode }),
@@ -340,20 +350,22 @@ describe("POST /v1/auth/device/authorize — device code authorization", () => {
 });
 
 describe("POST /v1/auth/token — token polling", () => {
+  beforeEach(() => {
+    mockAuthUser = testUser;
+  });
+
   it("returns authorization_pending (400) per RFC 8628", async () => {
-    const cache = createMockKV();
     const db = createMockDB();
-    const app = createTestApp(cache, db);
+    const { request } = createTestApp(db);
 
-    await cache.put(
-      "device:test-dc",
-      JSON.stringify({ user_code: "TC", status: "pending" }),
-    );
+    // Create a pending device code
+    const createRes = await request("/v1/auth/device", { method: "POST" });
+    const { device_code } = (await createRes.json()) as { device_code: string };
 
-    const res = await app.request("/v1/auth/token", {
+    const res = await request("/v1/auth/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: "device_code=test-dc",
+      body: `device_code=${device_code}`,
     });
 
     expect(res.status).toBe(400);
@@ -362,32 +374,30 @@ describe("POST /v1/auth/token — token polling", () => {
   });
 
   it("returns access_token after authorization", async () => {
-    const cache = createMockKV();
     const db = createMockDB({
-      firstFn: (sql) => {
+      firstFn: (sql, params) => {
         if (sql.includes("SELECT id FROM users")) {
           return { id: "existing-user-id" };
         }
-        return null;
+        return undefined;
       },
     });
-    const app = createTestApp(cache, db);
+    const { request } = createTestApp(db);
 
-    await cache.put(
-      "device:test-dc",
-      JSON.stringify({
-        user_code: "TC",
-        status: "authorized",
-        github_id: "12345",
-        username: "alice",
-        email: "alice@example.com",
-      }),
-    );
+    // Create and authorize a device code
+    const createRes = await request("/v1/auth/device", { method: "POST" });
+    const { device_code, user_code } = (await createRes.json()) as { device_code: string; user_code: string };
 
-    const res = await app.request("/v1/auth/token", {
+    await request("/v1/auth/device/authorize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_code }),
+    });
+
+    const res = await request("/v1/auth/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: "device_code=test-dc",
+      body: `device_code=${device_code}`,
     });
 
     expect(res.status).toBe(200);
@@ -398,25 +408,23 @@ describe("POST /v1/auth/token — token polling", () => {
   });
 
   it("creates user + scope + API token in DB for new user", async () => {
-    const cache = createMockKV();
-    const db = createMockDB(); // firstFn returns null → user not found → creates new
-    const app = createTestApp(cache, db);
+    const db = createMockDB();
+    const { request } = createTestApp(db);
 
-    await cache.put(
-      "device:test-dc",
-      JSON.stringify({
-        user_code: "TC",
-        status: "authorized",
-        github_id: "12345",
-        username: "alice",
-        email: "",
-      }),
-    );
+    // Create and authorize
+    const createRes = await request("/v1/auth/device", { method: "POST" });
+    const { device_code, user_code } = (await createRes.json()) as { device_code: string; user_code: string };
 
-    await app.request("/v1/auth/token", {
+    await request("/v1/auth/device/authorize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_code }),
+    });
+
+    await request("/v1/auth/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: "device_code=test-dc",
+      body: `device_code=${device_code}`,
     });
 
     const userInsert = db._executed.find((e) => e.sql.includes("INSERT INTO users"));
@@ -427,26 +435,30 @@ describe("POST /v1/auth/token — token polling", () => {
   });
 
   it("creates API token for existing user without inserting new user", async () => {
-    const cache = createMockKV();
     const db = createMockDB({
       firstFn: (sql) => {
         if (sql.includes("SELECT id FROM users")) {
           return { id: "user-id" };
         }
-        return null;
+        return undefined;
       },
     });
-    const app = createTestApp(cache, db);
+    const { request } = createTestApp(db);
 
-    await cache.put(
-      "device:test-dc",
-      JSON.stringify({ user_code: "TC", status: "authorized", github_id: "12345", username: "alice", email: "" }),
-    );
+    // Create and authorize
+    const createRes = await request("/v1/auth/device", { method: "POST" });
+    const { device_code, user_code } = (await createRes.json()) as { device_code: string; user_code: string };
 
-    await app.request("/v1/auth/token", {
+    await request("/v1/auth/device/authorize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_code }),
+    });
+
+    await request("/v1/auth/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: "device_code=test-dc",
+      body: `device_code=${device_code}`,
     });
 
     const tokenInsert = db._executed.find((e) => e.sql.includes("INSERT INTO api_tokens"));
@@ -457,33 +469,43 @@ describe("POST /v1/auth/token — token polling", () => {
   });
 
   it("cleans up device code after token issued", async () => {
-    const cache = createMockKV();
     const db = createMockDB({
-      firstFn: () => ({ id: "user-id" }),
+      firstFn: (sql) => {
+        if (sql.includes("SELECT id FROM users")) return { id: "user-id" };
+        return undefined;
+      },
     });
-    const app = createTestApp(cache, db);
+    const { request } = createTestApp(db);
 
-    await cache.put(
-      "device:test-dc",
-      JSON.stringify({ user_code: "TC", status: "authorized", github_id: "12345", username: "alice", email: "" }),
-    );
+    // Create and authorize
+    const createRes = await request("/v1/auth/device", { method: "POST" });
+    const { device_code, user_code } = (await createRes.json()) as { device_code: string; user_code: string };
 
-    await app.request("/v1/auth/token", {
+    await request("/v1/auth/device/authorize", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_code }),
+    });
+
+    await request("/v1/auth/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: "device_code=test-dc",
+      body: `device_code=${device_code}`,
     });
 
-    const remaining = await cache.get("device:test-dc");
-    expect(remaining).toBeNull();
+    // Verify device code was deleted from D1
+    const deleteOp = db._executed.find(
+      (e) => e.sql.includes("DELETE FROM device_codes") && e.sql.includes("device_code = ?")
+    );
+    expect(deleteOp).toBeDefined();
+    expect(db._deviceCodes.has(device_code)).toBe(false);
   });
 
   it("returns expired_token for missing device code", async () => {
-    const cache = createMockKV();
     const db = createMockDB();
-    const app = createTestApp(cache, db);
+    const { request } = createTestApp(db);
 
-    const res = await app.request("/v1/auth/token", {
+    const res = await request("/v1/auth/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: "device_code=nonexistent",
@@ -495,11 +517,10 @@ describe("POST /v1/auth/token — token polling", () => {
   });
 
   it("returns invalid_request when device_code missing", async () => {
-    const cache = createMockKV();
     const db = createMockDB();
-    const app = createTestApp(cache, db);
+    const { request } = createTestApp(db);
 
-    const res = await app.request("/v1/auth/token", {
+    const res = await request("/v1/auth/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: "",

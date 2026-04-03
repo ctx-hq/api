@@ -33,7 +33,6 @@ function createTestApp(opts: {
       DB: mockDB,
       FORMULAS: {},
       PRIVATE_FORMULAS: {},
-      CACHE: { get: async () => null, put: async () => {} },
     };
     await next();
   });
