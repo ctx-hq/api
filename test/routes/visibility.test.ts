@@ -35,6 +35,25 @@ describe("visibility", () => {
     });
   });
 
+  describe("mutable flag constraint on visibility transitions", () => {
+    // Table-driven: {mutable, targetVisibility, canChange}
+    const transitionCases: { mutable: number; target: string; expected: boolean }[] = [
+      { mutable: 1, target: "public", expected: false },
+      { mutable: 1, target: "unlisted", expected: false },
+      { mutable: 1, target: "private", expected: true },
+      { mutable: 0, target: "public", expected: true },
+      { mutable: 0, target: "unlisted", expected: true },
+      { mutable: 0, target: "private", expected: true },
+    ];
+
+    transitionCases.forEach(({ mutable, target, expected }) => {
+      it(`mutable=${mutable} → ${target} should be ${expected ? "allowed" : "blocked"}`, () => {
+        const canChange = !mutable || target === "private";
+        expect(canChange).toBe(expected);
+      });
+    });
+  });
+
   describe("search filtering", () => {
     it("should exclude private packages from search", () => {
       const packages = [

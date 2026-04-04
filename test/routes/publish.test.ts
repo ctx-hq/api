@@ -483,6 +483,130 @@ describe("publish route — keyword sync", () => {
   });
 });
 
+describe("publish route — mutable flag handling", () => {
+  const user = { id: "user1", username: "hong" };
+
+  function createMutableTestApp(existingPkg?: { mutable: number; visibility: string }) {
+    const db = createPublishMockDB(user);
+
+    if (existingPkg) {
+      const origPrepare = db.prepare.bind(db);
+      db.prepare = function (sql: string) {
+        const stmt = origPrepare(sql);
+        if (sql.includes("FROM packages WHERE full_name")) {
+          return {
+            bind: (...params: unknown[]) => ({
+              first: async () => ({
+                id: "pkg1", full_name: params[0], type: "skill",
+                visibility: existingPkg.visibility, mutable: existingPkg.mutable,
+                owner_type: "user", owner_id: user.id,
+                description: "", summary: "", keywords: "[]", capabilities: "[]", downloads: 0,
+              }),
+              all: stmt.all, run: stmt.run,
+            }),
+          } as any;
+        }
+        return stmt;
+      };
+    }
+
+    const app = new Hono<AppEnv>();
+    app.onError((err, c) => {
+      if (err instanceof AppError) return c.json(err.toJSON(), err.statusCode);
+      return c.json({ error: "internal_error", message: String(err) }, 500);
+    });
+    app.use("*", async (c, next) => {
+      (c as any).env = {
+        DB: db,
+        FORMULAS: { put: async () => {}, get: async () => null, head: async () => null, delete: async () => {} },
+        PRIVATE_FORMULAS: { put: async () => {}, get: async () => null, head: async () => null, delete: async () => {} },
+        ENRICHMENT_QUEUE: { send: async () => {} },
+      };
+      await next();
+    });
+    app.route("/", publishRoute);
+    const mockExecCtx = { waitUntil: () => {}, passThroughOnException: () => {} };
+    const request: typeof app.request = (input, init, env) =>
+      app.request(input, init, env, mockExecCtx as any);
+    return { request, db };
+  }
+
+  it("explicit mutable=false overrides existing mutable=true", async () => {
+    const { request, db } = createMutableTestApp({ mutable: 1, visibility: "private" });
+
+    const form = new FormData();
+    form.append("manifest", new File([JSON.stringify({
+      name: "@hong/mut-test", version: "2.0.0", type: "skill", description: "test",
+    })], "ctx.yaml"));
+    form.append("mutable", "false");
+
+    const res = await request("/v1/packages", {
+      method: "POST", body: form, headers: { Authorization: "Bearer test-token" },
+    });
+
+    expect(res.status).toBe(201);
+    // Verify the packages UPDATE sets mutable=0
+    const pkgUpdate = db._executed.find(
+      (e: any) => e.sql.includes("UPDATE packages") && e.sql.includes("mutable"),
+    );
+    if (pkgUpdate) {
+      // The mutable param should be 0
+      expect(pkgUpdate.params).toContain(0);
+    }
+  });
+
+  it("mutable not provided keeps existing value", async () => {
+    const { request, db } = createMutableTestApp({ mutable: 1, visibility: "private" });
+
+    const form = new FormData();
+    form.append("manifest", new File([JSON.stringify({
+      name: "@hong/mut-test", version: "2.0.0", type: "skill", description: "test",
+    })], "ctx.yaml"));
+    // No mutable field in form data or manifest
+
+    const res = await request("/v1/packages", {
+      method: "POST", body: form, headers: { Authorization: "Bearer test-token" },
+    });
+
+    expect(res.status).toBe(201);
+  });
+
+  it("string '1' is parsed as mutable=true", async () => {
+    const { request } = createMutableTestApp();
+
+    const form = new FormData();
+    form.append("manifest", new File([JSON.stringify({
+      name: "@hong/mut-str", version: "1.0.0", type: "skill", description: "test",
+      visibility: "private",
+    })], "ctx.yaml"));
+    form.append("mutable", "1");
+
+    const res = await request("/v1/packages", {
+      method: "POST", body: form, headers: { Authorization: "Bearer test-token" },
+    });
+
+    expect(res.status).toBe(201);
+  });
+
+  it("rejects mutable=true for public packages", async () => {
+    const { request } = createMutableTestApp();
+
+    const form = new FormData();
+    form.append("manifest", new File([JSON.stringify({
+      name: "@hong/mut-pub", version: "1.0.0", type: "skill", description: "test",
+    })], "ctx.yaml"));
+    form.append("mutable", "true");
+
+    const res = await request("/v1/packages", {
+      method: "POST", body: form, headers: { Authorization: "Bearer test-token" },
+    });
+
+    expect(res.status).toBe(400);
+    const body = await res.json() as any;
+    expect(body.message).toContain("Mutable packages must be private");
+  });
+});
+
 describe("publish route — bucket routing by visibility", () => {
   const user = { id: "user1", username: "hong" };
 

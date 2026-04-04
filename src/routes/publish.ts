@@ -82,13 +82,15 @@ app.post("/v1/packages", authMiddleware, requireScope("publish"), async (c) => {
     throw badRequest("visibility must be public, unlisted, or private");
   }
   const mutableRaw = formData.get("mutable") ?? manifest.mutable;
-  const requestedMutable = mutableRaw === "true" || mutableRaw === true || mutableRaw === 1 ? 1 : 0;
+  const mutableExplicit = formData.has("mutable") || manifest.mutable !== undefined;
+  const requestedMutable = (mutableRaw === "true" || mutableRaw === true || mutableRaw === 1 || mutableRaw === "1") ? 1 : 0;
 
   if (description.length > 1024) {
     throw badRequest("Description must be 1024 characters or less");
   }
 
-  const parsed = parseFullName(name)!;
+  const parsed = parseFullName(name);
+  if (!parsed) throw badRequest(`Invalid package name: ${name}`);
 
   // ── Token package scope check ──
   if (!tokenCanActOnPackage(c, name)) {
@@ -141,7 +143,19 @@ app.post("/v1/packages", authMiddleware, requireScope("publish"), async (c) => {
     );
   }
 
-  const mutable = pkg ? (requestedMutable || (pkg.mutable as number)) : requestedMutable;
+  // Resolve mutable flag. For existing packages, only change if explicitly requested
+  // AND the user has manage permission (same bar as PATCH /mutable).
+  let mutable: number;
+  if (!pkg) {
+    mutable = requestedMutable;
+  } else if (mutableExplicit && requestedMutable !== (pkg.mutable as number)) {
+    if (!(await canManage(c.env.DB, user.id, parsed.scope))) {
+      throw forbidden("Only owners and admins can change the mutable flag");
+    }
+    mutable = requestedMutable;
+  } else {
+    mutable = pkg.mutable as number;
+  }
   if (mutable && visibility !== "private") {
     throw badRequest("Mutable packages must be private");
   }
