@@ -151,7 +151,14 @@ app.post("/v1/packages", authMiddleware, requireScope("publish"), async (c) => {
     try { hubMeta = JSON.parse(metadataRaw); } catch { /* ignore */ }
   }
 
-  const keywords = JSON.stringify(manifest.keywords ?? []);
+  const manifestKw = manifest.keywords ?? [];
+  if (!Array.isArray(manifestKw)) {
+    throw badRequest("keywords must be an array");
+  }
+  if (manifestKw.length > 20) {
+    throw badRequest("keywords must have at most 20 items");
+  }
+  const keywords = JSON.stringify(manifestKw);
   const license = (manifest.license as string) ?? "";
   const summary = hubMeta.summary ?? "";
   const capabilities = hubMeta.capabilities ? JSON.stringify(hubMeta.capabilities) : "[]";

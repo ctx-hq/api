@@ -110,10 +110,10 @@ describe("categories — list", () => {
 });
 
 describe("keywords — list", () => {
-  it("GET /v1/keywords returns popular keywords", async () => {
+  it("GET /v1/keywords returns popular keywords (visibility-aware)", async () => {
     const db = createMockDB({
       allFn: (sql) => {
-        if (sql.includes("FROM keywords")) {
+        if (sql.includes("FROM keywords") && sql.includes("JOIN")) {
           return [
             { slug: "database", usage_count: 25 },
             { slug: "api", usage_count: 18 },
@@ -132,6 +132,12 @@ describe("keywords — list", () => {
     expect(body.keywords).toHaveLength(3);
     expect(body.keywords[0].slug).toBe("database");
     expect(body.keywords[0].usage_count).toBe(25);
+
+    // Verify the query filters by public visibility
+    const kwQuery = db._executed.find(e => e.sql.includes("FROM keywords"));
+    expect(kwQuery).toBeDefined();
+    expect(kwQuery!.sql).toContain("visibility = 'public'");
+    expect(kwQuery!.sql).toContain("deleted_at IS NULL");
   });
 
   it("GET /v1/keywords respects limit parameter", async () => {
@@ -144,7 +150,6 @@ describe("keywords — list", () => {
 
     expect(res.status).toBe(200);
 
-    // Verify LIMIT is passed to query
     const limitQuery = db._executed.find(e => e.sql.includes("FROM keywords"));
     expect(limitQuery).toBeDefined();
     expect(limitQuery!.params).toContain(10);
@@ -171,6 +176,86 @@ describe("keywords — list", () => {
     expect(res.status).toBe(200);
     const body = await res.json() as any;
     expect(body.keywords).toEqual([]);
+  });
+});
+
+describe("keywords — detail", () => {
+  it("GET /v1/keywords/:slug returns keyword with packages", async () => {
+    const db = createMockDB({
+      firstFn: (sql, params) => {
+        if (sql.includes("FROM keywords k") && sql.includes("GROUP BY")) {
+          return { slug: "database", usage_count: 2 };
+        }
+        return null;
+      },
+      allFn: (sql) => {
+        if (sql.includes("FROM packages p") && sql.includes("JOIN package_keywords")) {
+          return [
+            { full_name: "@user/postgres-mcp", type: "mcp", description: "PG toolkit", summary: "", downloads: 100, star_count: 5, updated_at: "2025-01-01", latest_version: "1.0.0" },
+            { full_name: "@user/sqlite-tool", type: "skill", description: "SQLite util", summary: "", downloads: 50, star_count: 2, updated_at: "2025-01-02", latest_version: "0.5.0" },
+          ];
+        }
+        return [];
+      },
+    });
+
+    const app = createCategoriesApp(db);
+    const res = await app.request("/v1/keywords/database");
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.keyword).toEqual({ slug: "database", usage_count: 2 });
+    expect(body.packages).toHaveLength(2);
+    expect(body.packages[0].full_name).toBe("@user/postgres-mcp");
+    expect(body.total).toBe(2);
+  });
+
+  it("GET /v1/keywords/:slug returns 404 for unknown keyword", async () => {
+    const db = createMockDB();
+    const app = createCategoriesApp(db);
+    const res = await app.request("/v1/keywords/nonexistent");
+
+    expect(res.status).toBe(404);
+  });
+
+  it("GET /v1/keywords/:slug returns 404 when keyword exists but no public packages (prevents private metadata leak)", async () => {
+    const db = createMockDB({
+      firstFn: (sql) => {
+        // JOIN query returns null (no public packages)
+        if (sql.includes("GROUP BY")) return null;
+        return null;
+      },
+    });
+
+    const app = createCategoriesApp(db);
+    const res = await app.request("/v1/keywords/internal");
+
+    expect(res.status).toBe(404);
+  });
+
+  it("GET /v1/keywords/:slug respects pagination", async () => {
+    const db = createMockDB({
+      firstFn: (sql) => {
+        if (sql.includes("GROUP BY")) return { slug: "api", usage_count: 50 };
+        return null;
+      },
+      allFn: () => [
+        { full_name: "@user/pkg1", type: "skill", description: "Pkg 1", summary: "", downloads: 10, star_count: 0, updated_at: "2025-01-01", latest_version: "1.0.0" },
+      ],
+    });
+
+    const app = createCategoriesApp(db);
+    const res = await app.request("/v1/keywords/api?limit=10&offset=20");
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.total).toBe(50);
+
+    // Verify pagination params passed to query
+    const pkgQuery = db._executed.find(e => e.sql.includes("FROM packages p") && e.sql.includes("LIMIT"));
+    expect(pkgQuery).toBeDefined();
+    expect(pkgQuery!.params).toContain(10);
+    expect(pkgQuery!.params).toContain(20);
   });
 });
 
