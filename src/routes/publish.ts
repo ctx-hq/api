@@ -76,14 +76,11 @@ app.post("/v1/packages", authMiddleware, requireScope("publish"), async (c) => {
     if (!cli || !cli.binary) throw badRequest("cli.binary is required for type=cli");
   }
 
-  // ── Visibility & mutable (resolved after existing package lookup below) ──
+  // ── Visibility ──
   const requestedVisibility = (formData.get("visibility") as string) ?? (manifest.visibility as string) ?? null;
   if (requestedVisibility && !["public", "unlisted", "private"].includes(requestedVisibility)) {
     throw badRequest("visibility must be public, unlisted, or private");
   }
-  const mutableRaw = formData.get("mutable") ?? manifest.mutable;
-  const mutableExplicit = formData.has("mutable") || manifest.mutable !== undefined;
-  const requestedMutable = (mutableRaw === "true" || mutableRaw === true || mutableRaw === 1 || mutableRaw === "1") ? 1 : 0;
 
   if (description.length > 1024) {
     throw badRequest("Description must be 1024 characters or less");
@@ -143,23 +140,6 @@ app.post("/v1/packages", authMiddleware, requireScope("publish"), async (c) => {
     );
   }
 
-  // Resolve mutable flag. For existing packages, only change if explicitly requested
-  // AND the user has manage permission (same bar as PATCH /mutable).
-  let mutable: number;
-  if (!pkg) {
-    mutable = requestedMutable;
-  } else if (mutableExplicit && requestedMutable !== (pkg.mutable as number)) {
-    if (!(await canManage(c.env.DB, user.id, parsed.scope))) {
-      throw forbidden("Only owners and admins can change the mutable flag");
-    }
-    mutable = requestedMutable;
-  } else {
-    mutable = pkg.mutable as number;
-  }
-  if (mutable && visibility !== "private") {
-    throw badRequest("Mutable packages must be private");
-  }
-
   // Parse optional hub metadata
   const metadataRaw = formData.get("metadata");
   let hubMeta: {
@@ -184,44 +164,31 @@ app.post("/v1/packages", authMiddleware, requireScope("publish"), async (c) => {
   if (!pkg) {
     await c.env.DB.prepare(
       `INSERT INTO packages (id, scope, name, full_name, type, description, keywords, license, summary, capabilities,
-       author, homepage, repository, import_source, import_external_id, owner_id, owner_type, visibility, mutable, source_repo)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       author, homepage, repository, import_source, import_external_id, owner_id, owner_type, visibility, source_repo)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       pkgId, parsed.scope, parsed.name, name, type_, description,
       keywords, license, summary, capabilities, author, homepage, repository,
-      importSource, importExternalId, scopeOwner.owner_id, scopeOwner.owner_type, visibility, mutable, repository,
+      importSource, importExternalId, scopeOwner.owner_id, scopeOwner.owner_type, visibility, repository,
     ).run();
   } else {
     // Update metadata on re-publish (visibility unchanged — use PATCH /visibility to change)
     await c.env.DB.prepare(
-      "UPDATE packages SET description = ?, keywords = ?, license = ?, author = ?, homepage = ?, repository = ?, mutable = ?, updated_at = datetime('now') WHERE id = ?",
-    ).bind(description, keywords, license, author, homepage, repository, mutable, pkgId).run();
+      "UPDATE packages SET description = ?, keywords = ?, license = ?, author = ?, homepage = ?, repository = ?, updated_at = datetime('now') WHERE id = ?",
+    ).bind(description, keywords, license, author, homepage, repository, pkgId).run();
   }
 
   // Always store manifest as JSON for consistent downstream consumption
   const manifestJson = JSON.stringify(manifest);
   const manifestHash = await computeSHA256(manifestJson);
 
-  // ── Mutable version handling ──
+  // ── Version uniqueness check (immutable) ──
   const existingVersion = await c.env.DB.prepare(
     "SELECT id FROM versions WHERE package_id = ? AND version = ?",
   ).bind(pkgId, version).first();
 
   if (existingVersion) {
-    if (mutable) {
-      // Overwrite: delete old version data, re-create
-      await c.env.DB.batch([
-        c.env.DB.prepare("DELETE FROM skill_metadata WHERE version_id = ?").bind(existingVersion.id),
-        c.env.DB.prepare("DELETE FROM mcp_metadata WHERE version_id = ?").bind(existingVersion.id),
-        c.env.DB.prepare("DELETE FROM cli_metadata WHERE version_id = ?").bind(existingVersion.id),
-        c.env.DB.prepare("DELETE FROM install_metadata WHERE version_id = ?").bind(existingVersion.id),
-        c.env.DB.prepare("DELETE FROM trust_checks WHERE version_id = ?").bind(existingVersion.id),
-      ]);
-      // Note: archive_sha256 and formula_key will be set after archive is stored in R2
-      // We defer the full UPDATE to after archive processing below
-    } else {
-      throw conflict(`Version ${version} already exists for ${name}`);
-    }
+    throw conflict(`Version ${version} already exists for ${name}`);
   }
 
   // ── Store archive in R2 + compute archive SHA256 ──
@@ -245,33 +212,12 @@ app.post("/v1/packages", authMiddleware, requireScope("publish"), async (c) => {
   const readmeFile = formData.get("readme");
   const readmeText = readmeFile instanceof File ? await readmeFile.text() : "";
 
-  const versionId = existingVersion
-    ? (existingVersion.id as string)
-    : generateId();
+  const versionId = generateId();
 
-  if (!existingVersion) {
-    await c.env.DB.prepare(
-      `INSERT INTO versions (id, package_id, version, manifest, readme, formula_key, sha256, archive_sha256, published_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(versionId, pkgId, version, manifestJson, readmeText, formulaKey, manifestHash, archiveSHA256, user.id).run();
-  } else {
-    // Mutable re-publish: single UPDATE with all changed fields
-    const updates = ["manifest = ?", "sha256 = ?", "trust_tier = 'unverified'", "created_at = datetime('now')"];
-    const binds: unknown[] = [manifestJson, manifestHash];
-    if (archiveSHA256) {
-      updates.push("archive_sha256 = ?");
-      updates.push("formula_key = ?");
-      binds.push(archiveSHA256, formulaKey);
-    }
-    if (readmeText) {
-      updates.push("readme = ?");
-      binds.push(readmeText);
-    }
-    binds.push(versionId);
-    await c.env.DB.prepare(
-      `UPDATE versions SET ${updates.join(", ")} WHERE id = ?`,
-    ).bind(...binds).run();
-  }
+  await c.env.DB.prepare(
+    `INSERT INTO versions (id, package_id, version, manifest, readme, formula_key, sha256, archive_sha256, published_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(versionId, pkgId, version, manifestJson, readmeText, formulaKey, manifestHash, archiveSHA256, user.id).run();
 
   // ── Extract type-specific metadata ──
   const metaResult = await extractTypeMetadata(c.env.DB, versionId, manifest, pkgId);

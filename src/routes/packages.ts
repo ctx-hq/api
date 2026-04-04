@@ -90,7 +90,7 @@ app.get("/v1/packages/:fullName", optionalAuth, async (c) => {
   const pkg = await c.env.DB.prepare(
     `SELECT id, full_name, type, description, summary, capabilities, license,
             repository, homepage, author, keywords, platforms, downloads, star_count,
-            visibility, mutable, owner_type, owner_id, created_at, updated_at
+            visibility, owner_type, owner_id, created_at, updated_at
      FROM packages WHERE full_name = ? AND deleted_at IS NULL`
   ).bind(fullName).first();
 
@@ -219,7 +219,6 @@ app.get("/v1/packages/:fullName", optionalAuth, async (c) => {
     star_count: (pkg.star_count as number) ?? 0,
     is_starred: isStarred,
     visibility: pkg.visibility ?? "public",
-    mutable: !!(pkg.mutable as number),
     owner: ownerInfo ? { slug: ownerInfo.slug, kind: ownerInfo.kind, avatar_url: ownerInfo.avatar_url } : null,
     dist_tags: distTags,
     versions: versions.results ?? [],
@@ -312,7 +311,7 @@ app.patch("/v1/packages/:fullName/visibility", authMiddleware, requireScope("man
   }
 
   const pkg = await c.env.DB.prepare(
-    "SELECT id, full_name, type, description, summary, keywords, capabilities, downloads, owner_type, owner_id, visibility, mutable FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+    "SELECT id, full_name, type, description, summary, keywords, capabilities, downloads, owner_type, owner_id, visibility FROM packages WHERE full_name = ? AND deleted_at IS NULL",
   ).bind(fullName).first();
 
   if (!pkg) throw notFound(`Package ${fullName} not found`);
@@ -322,11 +321,6 @@ app.patch("/v1/packages/:fullName/visibility", authMiddleware, requireScope("man
   if (!parsed) throw badRequest("Invalid package name");
   if (!(await canManage(c.env.DB, user.id, parsed.scope))) {
     throw forbidden("Only org owners and admins can change visibility");
-  }
-
-  // Mutable constraint: mutable only allowed for private
-  if (pkg.mutable && visibility !== "private") {
-    throw badRequest("Mutable packages must remain private. Set mutable=false first.");
   }
 
   const oldVisibility = pkg.visibility as string;
@@ -378,52 +372,6 @@ app.patch("/v1/packages/:fullName/visibility", authMiddleware, requireScope("man
   }
 
   return c.json({ full_name: fullName, visibility });
-});
-
-// Set mutable flag
-app.patch("/v1/packages/:fullName/mutable", authMiddleware, requireScope("manage-access"), async (c) => {
-  const user = c.get("user");
-  const fullName = decodeURIComponent(c.req.param("fullName")!);
-
-  const parsed = parseFullName(fullName);
-  if (!parsed) throw badRequest("Invalid package name");
-
-  if (!tokenCanActOnPackage(c, fullName)) {
-    throw forbidden(`Token does not have permission to act on package ${fullName}`);
-  }
-
-  let body: { mutable: boolean };
-  try {
-    body = await c.req.json();
-  } catch {
-    throw badRequest("Invalid JSON body");
-  }
-
-  if (typeof body.mutable !== "boolean") {
-    throw badRequest("mutable must be a boolean");
-  }
-
-  const pkg = await c.env.DB.prepare(
-    "SELECT id, full_name, visibility, mutable FROM packages WHERE full_name = ? AND deleted_at IS NULL",
-  ).bind(fullName).first();
-
-  if (!pkg) throw notFound(`Package ${fullName} not found`);
-  if (!(await canManage(c.env.DB, user.id, parsed.scope))) {
-    throw forbidden("Only owners and admins can change mutable flag");
-  }
-
-  const newMutable = body.mutable ? 1 : 0;
-
-  // Cannot set mutable=true on non-private packages
-  if (newMutable && (pkg.visibility as string) !== "private") {
-    throw badRequest("Mutable packages must be private");
-  }
-
-  await c.env.DB.prepare(
-    "UPDATE packages SET mutable = ?, updated_at = datetime('now') WHERE id = ?",
-  ).bind(newMutable, pkg.id).run();
-
-  return c.json({ full_name: fullName, mutable: !!newMutable });
 });
 
 // Deprecate a package (requires admin+ for org packages)

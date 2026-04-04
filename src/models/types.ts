@@ -29,7 +29,6 @@ export interface PackageRow {
   owner_type: OwnerType;
   owner_id: string;
   visibility: Visibility;
-  mutable: number;
   deleted_at: string | null;
   deprecated_message: string | null;
   deprecated_at: string | null;

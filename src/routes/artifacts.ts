@@ -60,7 +60,7 @@ app.post(
 
     // Lookup package
     const pkg = await c.env.DB.prepare(
-      "SELECT id, visibility, owner_type, owner_id, mutable FROM packages WHERE full_name = ? AND deleted_at IS NULL",
+      "SELECT id, visibility, owner_type, owner_id FROM packages WHERE full_name = ? AND deleted_at IS NULL",
     ).bind(fullName).first();
 
     if (!pkg) throw notFound(`Package ${fullName} not found`);
@@ -88,10 +88,7 @@ app.post(
     ).bind(versionId, platform).first();
 
     if (existing) {
-      if (!(pkg.mutable as number)) {
-        throw conflict(`Artifact for platform ${platform} already exists and package is not mutable`);
-      }
-      // Overwrite: will update below
+      throw conflict(`Artifact for platform ${platform} already exists for version ${version}`);
     }
 
     // Read archive and compute SHA256
@@ -103,20 +100,7 @@ app.post(
     const r2Key = `artifacts/${fullName}/${version}/${platform}.tar.gz`;
     await getFormulaBucket(c.env, pkg.visibility as string).put(r2Key, archiveBuffer);
 
-    if (existing) {
-      // Update existing artifact
-      await c.env.DB.prepare(
-        "UPDATE version_artifacts SET formula_key = ?, sha256 = ?, size = ?, created_at = datetime('now') WHERE id = ?",
-      ).bind(r2Key, sha256, size, existing.id).run();
 
-      return c.json({
-        platform,
-        sha256,
-        size,
-        version,
-        full_name: fullName,
-      }, 200);
-    }
 
     // Insert new artifact
     const artifactId = generateId();

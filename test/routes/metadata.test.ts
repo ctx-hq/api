@@ -70,7 +70,6 @@ const mockPkg = {
   visibility: "public",
   owner_type: "user",
   owner_id: "user-1",
-  mutable: 0,
 };
 
 const authHeaders = { Authorization: "Bearer test-token", "Content-Type": "application/json" };

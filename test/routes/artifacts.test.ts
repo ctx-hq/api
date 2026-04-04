@@ -8,7 +8,7 @@ import artifactsRoute from "../../src/routes/artifacts";
 
 function createArtifactMockDB(opts: {
   user: { id: string; username: string };
-  pkg?: { id: string; visibility: string; owner_type: string; owner_id: string; mutable: number } | null;
+  pkg?: { id: string; visibility: string; owner_type: string; owner_id: string } | null;
   version?: { id: string } | null;
   existingArtifact?: { id: string } | null;
   artifacts?: Array<{ platform: string; sha256: string; size: number; created_at: string }>;
@@ -122,7 +122,7 @@ function buildUploadForm(platform: string, archiveContent = "fake-binary-data"):
 }
 
 const defaultUser = { id: "user1", username: "hong" };
-const defaultPkg = { id: "pkg1", visibility: "public", owner_type: "user", owner_id: "user1", mutable: 0 };
+const defaultPkg = { id: "pkg1", visibility: "public", owner_type: "user", owner_id: "user1" };
 const defaultVersion = { id: "ver1" };
 
 describe("POST /v1/packages/:fullName/versions/:version/artifacts", () => {
@@ -171,10 +171,10 @@ describe("POST /v1/packages/:fullName/versions/:version/artifacts", () => {
     expect(body.message).toContain("Invalid platform");
   });
 
-  it("rejects duplicate platform on non-mutable package → 409", async () => {
+  it("rejects duplicate platform artifact → 409", async () => {
     const { request } = createApp({
       user: defaultUser,
-      pkg: { ...defaultPkg, mutable: 0 },
+      pkg: defaultPkg,
       version: defaultVersion,
       existingArtifact: { id: "art1" },
     });
@@ -191,29 +191,6 @@ describe("POST /v1/packages/:fullName/versions/:version/artifacts", () => {
     expect(res.status).toBe(409);
     const body = await res.json() as any;
     expect(body.message).toContain("already exists");
-  });
-
-  it("overwrites duplicate platform on mutable package → 200", async () => {
-    const { request } = createApp({
-      user: defaultUser,
-      pkg: { ...defaultPkg, mutable: 1 },
-      version: defaultVersion,
-      existingArtifact: { id: "art1" },
-    });
-
-    const res = await request(
-      "/v1/packages/%40hong%2Fmy-tool/versions/1.0.0/artifacts",
-      {
-        method: "POST",
-        body: buildUploadForm("darwin-arm64"),
-        headers: { Authorization: "Bearer test-token" },
-      },
-    );
-
-    expect(res.status).toBe(200);
-    const body = await res.json() as any;
-    expect(body.platform).toBe("darwin-arm64");
-    expect(body.sha256).toBeDefined();
   });
 });
 
@@ -406,7 +383,7 @@ describe("artifact bucket routing by visibility", () => {
     const privatePuts: string[] = [];
     const publicPuts: string[] = [];
 
-    const privatePkg = { id: "pkg1", visibility: "private", owner_type: "user", owner_id: "user1", mutable: 1 };
+    const privatePkg = { id: "pkg1", visibility: "private", owner_type: "user", owner_id: "user1" };
     const { request } = createApp(
       { user: defaultUser, pkg: privatePkg, version: defaultVersion },
       {
